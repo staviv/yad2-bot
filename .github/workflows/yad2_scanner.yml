@@ -1,0 +1,156 @@
+name: Yad2 Stealth Scanner to Google Apps Script
+
+on:
+  # 1. מאפשר הפעלה ידנית בכפתור "Run workflow" או הפעלה מרחוק ע"י Google Apps Script (כל 20±10 דקות או בפקודת /scan בטלגרם)
+  workflow_dispatch:
+
+  # 2. גיבוי אוטומטי מובנה ב-GitHub Actions (רץ כל 20 דקות עם השהיה אקראית אם לא חיברת טוקן של GitHub ל-Apps Script)
+  schedule:
+    - cron: '*/20 * * * *'
+
+jobs:
+  scan-yad2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: ⏱️ Random Jitter (Up to 180s when triggered by Cron)
+        if: github.event_name == 'schedule'
+        run: |
+          DELAY=$(( RANDOM % 180 ))
+          echo "Sleeping for ${DELAY}s to randomize timing..."
+          sleep $DELAY
+
+      - name: 📦 Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 🌐 Install Patchright (Stealth Chromium) & Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          npm init -y
+          npm install patchright
+          npx patchright install chromium --with-deps
+
+      - name: 🔍 Scrape Yad2 Searches & Push to Google Apps Script
+        env:
+          # ניתן להגדיר ב-GitHub Settings > Secrets > Actions תחת GAS_WEB_APP_URL, או להשתמש בכתובת המוגדרת כברירת מחדל:
+          GAS_WEB_APP_URL: ${{ secrets.GAS_WEB_APP_URL || 'https://script.google.com/macros/s/AKfycby2MJGz3Bq8fJJUtL8r0gWuJGa9I9H-1AaannsZuDyakbSIdq38wYpZrXIrRheMdshUgw/exec' }}
+        run: |
+          cat << 'EOF' > scan_yad2.mjs
+          import { chromium } from 'patchright';
+
+          const gasUrl = process.env.GAS_WEB_APP_URL;
+          if (!gasUrl) {
+            throw new Error('Missing GAS_WEB_APP_URL environment variable');
+          }
+
+          async function main() {
+            console.log('1. Fetching active search URLs from Google Sheets via Apps Script...');
+            const searchesRes = await fetch(`${gasUrl}?action=searches`, { redirect: 'follow' });
+            const searchesData = await searchesRes.json();
+
+            const searches = Array.isArray(searchesData.searches) ? searchesData.searches : [];
+            console.log(`Found ${searches.length} active search URLs in Google Sheets.`);
+            if (searches.length === 0) {
+              console.log('No active searches to scan. Exiting.');
+              return;
+            }
+
+            console.log('2. Launching Stealth Headful Chromium inside Xvfb...');
+            const browser = await chromium.launch({
+              headless: false,
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-blink-features=AutomationControlled',
+                '--window-size=1366,768',
+                '--lang=he-IL'
+              ]
+            });
+
+            const context = await browser.newContext({
+              locale: 'he-IL',
+              timezoneId: 'Asia/Jerusalem',
+              viewport: { width: 1366, height: 768 },
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+            });
+
+            const page = await context.newPage();
+            const pagesPayload = [];
+
+            // Warm-up visit to yad2 homepage to establish natural session cookies
+            try {
+              await page.goto('https://www.yad2.co.il/realestate/rent', { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await page.waitForTimeout(2500);
+            } catch (e) {
+              console.warn('Warm-up navigation note:', e.message);
+            }
+
+            for (let i = 0; i < searches.length; i++) {
+              const s = searches[i];
+              console.log(`Scanning [${i + 1}/${searches.length}]: ${s.name} -> ${s.url}`);
+              try {
+                await page.goto(s.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+
+                // Wait for __NEXT_DATA__ to be present and allow JS challenge (if any) to resolve
+                await page.waitForSelector('script#__NEXT_DATA__', { state: 'attached', timeout: 25000 });
+                await page.waitForTimeout(1500 + Math.floor(Math.random() * 1500));
+
+                const nextDataStr = await page.evaluate(() => {
+                  const el = document.getElementById('__NEXT_DATA__');
+                  return el ? el.textContent : null;
+                });
+
+                if (nextDataStr) {
+                  const nextDataObj = JSON.parse(nextDataStr);
+                  pagesPayload.push({
+                    name: s.name,
+                    url: s.url,
+                    nextData: nextDataObj
+                  });
+                  console.log(`Successfully extracted __NEXT_DATA__ for "${s.name}".`);
+                } else {
+                  const html = await page.content();
+                  pagesPayload.push({
+                    name: s.name,
+                    url: s.url,
+                    html: html
+                  });
+                }
+              } catch (err) {
+                console.error(`Error scanning "${s.name}":`, err.message);
+                pagesPayload.push({
+                  name: s.name,
+                  url: s.url,
+                  error: err.message
+                });
+              }
+            }
+
+            await browser.close();
+
+            console.log('3. Sending extracted Yad2 data to Google Apps Script (Sheets + Telegram)...');
+            const postRes = await fetch(gasUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                type: 'yad2_ingest',
+                pages: pagesPayload
+              }),
+              redirect: 'follow'
+            });
+
+            const postText = await postRes.text();
+            console.log('Google Apps Script Response:', postText);
+          }
+
+          main().catch((err) => {
+            console.error('Fatal error:', err);
+            process.exit(1);
+          });
+          EOF
+
+          xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node scan_yad2.mjs
