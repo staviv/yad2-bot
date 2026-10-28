@@ -1,16 +1,14 @@
 name: Yad2 Stealth Scanner to Google Apps Script
 
 on:
-  # 1. מאפשר הפעלה ידנית בכפתור "Run workflow" או הפעלה מרחוק ע"י Google Apps Script (כל 20±10 דקות או בפקודת /scan בטלגרם)
   workflow_dispatch:
-
-  # 2. גיבוי אוטומטי מובנה ב-GitHub Actions (רץ כל 20 דקות עם השהיה אקראית אם לא חיברת טוקן של GitHub ל-Apps Script)
   schedule:
     - cron: '*/20 * * * *'
 
 jobs:
   scan-yad2:
-    runs-on: ubuntu-latest
+    # שימוש ב-ubuntu-24.04 ספציפי כדי למנוע את הערת המעבר של ubuntu-latest ב-GitHub Actions
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
@@ -21,30 +19,102 @@ jobs:
           echo "Sleeping for ${DELAY}s to randomize timing..."
           sleep $DELAY
 
-      - name: 📦 Setup Node.js 20
+      - name: 📦 Setup Node.js 24
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
 
-      - name: 🌐 Install Patchright (Stealth Chromium) & Xvfb
+      - name: 🕵️ Cache CloakBrowser Binary & Persistent Profile
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cloakbrowser
+            ./yad2-profile
+          key: cloakbrowser-yad2-v1-${{ runner.os }}
+          restore-keys: |
+            cloakbrowser-yad2-v1-
+
+      - name: 🌐 Install CloakBrowser (C++ Patched Stealth Chromium) & Xvfb
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb
           npm init -y
-          npm install patchright
-          npx patchright install chromium --with-deps
+          npm install cloakbrowser playwright-core
+          npx playwright install-deps chromium
+          npx cloakbrowser install
 
-      - name: 🔍 Scrape Yad2 Searches & Push to Google Apps Script
+      - name: 🔍 Scrape Yad2 with CloakBrowser & Push to Google Apps Script
         env:
-          # ניתן להגדיר ב-GitHub Settings > Secrets > Actions תחת GAS_WEB_APP_URL, או להשתמש בכתובת המוגדרת כברירת מחדל:
           GAS_WEB_APP_URL: ${{ secrets.GAS_WEB_APP_URL || 'https://script.google.com/macros/s/AKfycby2MJGz3Bq8fJJUtL8r0gWuJGa9I9H-1AaannsZuDyakbSIdq38wYpZrXIrRheMdshUgw/exec' }}
+          # אופציונלי: אם תרצה להשתמש ב-Proxy מותאם אישית, ניתן להגדיר ב-GitHub Secrets תחת PROXY_URL
+          PROXY_URL: ${{ secrets.PROXY_URL || '' }}
         run: |
           cat << 'EOF' > scan_yad2.mjs
-          import { chromium } from 'patchright';
+          import { launchPersistentContext } from 'cloakbrowser';
 
           const gasUrl = process.env.GAS_WEB_APP_URL;
+          const proxyUrl = (process.env.PROXY_URL || '').trim();
+
           if (!gasUrl) {
             throw new Error('Missing GAS_WEB_APP_URL environment variable');
+          }
+
+          async function extractFromPageWithRetries(page, searchItem) {
+            for (let attempt = 1; attempt <= 2; attempt++) {
+              await page.goto(searchItem.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+
+              // Simulate human mouse movement and scroll so behavioral anti-bot checks pass
+              try {
+                await page.mouse.move(300 + Math.floor(Math.random() * 400), 250 + Math.floor(Math.random() * 300));
+                await page.waitForTimeout(1500);
+                await page.mouse.wheel(0, 300);
+              } catch (e) {}
+
+              // Poll up to 25 seconds for __NEXT_DATA__ or feed links (allows ShieldSquare JS redirect to finish)
+              for (let sec = 0; sec < 25; sec++) {
+                const state = await page.evaluate(() => {
+                  const el = document.getElementById('__NEXT_DATA__');
+                  if (el && el.textContent) {
+                    return { type: 'next_data', content: el.textContent, title: document.title };
+                  }
+                  const itemLinks = document.querySelectorAll('a[href*="/realestate/item/"]');
+                  if (itemLinks.length > 0) {
+                    return { type: 'html', content: document.documentElement.outerHTML, title: document.title };
+                  }
+                  return { type: 'waiting', title: document.title, bodyPreview: (document.body?.innerText || '').slice(0, 200) };
+                });
+
+                if (state.type === 'next_data') {
+                  return {
+                    name: searchItem.name,
+                    url: searchItem.url,
+                    nextData: JSON.parse(state.content)
+                  };
+                }
+                if (state.type === 'html') {
+                  return {
+                    name: searchItem.name,
+                    url: searchItem.url,
+                    html: state.content
+                  };
+                }
+                await page.waitForTimeout(1000);
+              }
+
+              const diagTitle = await page.title();
+              console.warn(`Attempt ${attempt} did not find __NEXT_DATA__. Page title: "${diagTitle}"`);
+            }
+
+            const finalTitle = await page.title();
+            const finalHtml = await page.content();
+            const isShieldSquare = finalHtml.includes('ShieldSquare') || finalHtml.includes('validate.perfdrive.com') || finalHtml.includes('stormcaster');
+            return {
+              name: searchItem.name,
+              url: searchItem.url,
+              error: isShieldSquare
+                ? `Yad2 ShieldSquare blocked GitHub Azure IP (Page title: ${finalTitle})`
+                : `No __NEXT_DATA__ found (Page title: ${finalTitle})`
+            };
           }
 
           async function main() {
@@ -59,66 +129,61 @@ jobs:
               return;
             }
 
-            console.log('2. Launching Stealth Headful Chromium inside Xvfb...');
-            const browser = await chromium.launch({
+            console.log('2. Launching CloakBrowser (C++ Stealth Chromium 146) inside Xvfb...');
+            const launchOpts = {
+              userDataDir: './yad2-profile',
               headless: false,
-              args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-blink-features=AutomationControlled',
-                '--window-size=1366,768',
-                '--lang=he-IL'
-              ]
-            });
-
-            const context = await browser.newContext({
+              humanize: true,
               locale: 'he-IL',
-              timezoneId: 'Asia/Jerusalem',
+              timezone: 'Asia/Jerusalem',
               viewport: { width: 1366, height: 768 },
-              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-            });
+              args: [
+                '--fingerprint=58492',
+                '--fingerprint-platform=windows',
+                '--fingerprint-screen-width=1366',
+                '--fingerprint-screen-height=768',
+                '--fingerprint-storage-quota=5000'
+              ]
+            };
+            if (proxyUrl) {
+              launchOpts.proxy = proxyUrl;
+              launchOpts.geoip = true;
+            }
+
+            const context = await launchPersistentContext(launchOpts);
+
+            // Pre-seed Yad2 ShieldSquare cookies into the persistent profile
+            await context.addCookies([
+              { name: '__ssds', value: '0', domain: '.yad2.co.il', path: '/' },
+              { name: '__ssuzjsr0', value: 'a9be0cd8e', domain: '.yad2.co.il', path: '/' },
+              { name: '__uzmaj0', value: '955190e7-4dc9-4ebb-8ae3-73a33a1f0dcf', domain: '.yad2.co.il', path: '/' },
+              { name: '__uzmbj0', value: '1793181117', domain: '.yad2.co.il', path: '/' },
+              { name: '__uzmcj0', value: '638991073980', domain: '.yad2.co.il', path: '/' },
+              { name: '__uzmdj0', value: '1793181117', domain: '.yad2.co.il', path: '/' }
+            ]);
 
             const page = await context.newPage();
             const pagesPayload = [];
 
-            // Warm-up visit to yad2 homepage to establish natural session cookies
+            // Warm-up on a low-sensitivity page first (Tip 06 from CloakBrowser docs for ShieldSquare)
             try {
-              await page.goto('https://www.yad2.co.il/realestate/rent', { waitUntil: 'domcontentloaded', timeout: 30000 });
-              await page.waitForTimeout(2500);
+              console.log('Warm-up visit to yad2.co.il...');
+              await page.goto('https://www.yad2.co.il/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await page.waitForTimeout(3000);
             } catch (e) {
-              console.warn('Warm-up navigation note:', e.message);
+              console.warn('Warm-up note:', e.message);
             }
 
             for (let i = 0; i < searches.length; i++) {
               const s = searches[i];
               console.log(`Scanning [${i + 1}/${searches.length}]: ${s.name} -> ${s.url}`);
               try {
-                await page.goto(s.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-
-                // Wait for __NEXT_DATA__ to be present and allow JS challenge (if any) to resolve
-                await page.waitForSelector('script#__NEXT_DATA__', { state: 'attached', timeout: 25000 });
-                await page.waitForTimeout(1500 + Math.floor(Math.random() * 1500));
-
-                const nextDataStr = await page.evaluate(() => {
-                  const el = document.getElementById('__NEXT_DATA__');
-                  return el ? el.textContent : null;
-                });
-
-                if (nextDataStr) {
-                  const nextDataObj = JSON.parse(nextDataStr);
-                  pagesPayload.push({
-                    name: s.name,
-                    url: s.url,
-                    nextData: nextDataObj
-                  });
-                  console.log(`Successfully extracted __NEXT_DATA__ for "${s.name}".`);
+                const resItem = await extractFromPageWithRetries(page, s);
+                pagesPayload.push(resItem);
+                if (resItem.nextData || resItem.html) {
+                  console.log(`✅ Extracted data for "${s.name}".`);
                 } else {
-                  const html = await page.content();
-                  pagesPayload.push({
-                    name: s.name,
-                    url: s.url,
-                    html: html
-                  });
+                  console.warn(`⚠️ Failed for "${s.name}": ${resItem.error}`);
                 }
               } catch (err) {
                 console.error(`Error scanning "${s.name}":`, err.message);
@@ -130,7 +195,7 @@ jobs:
               }
             }
 
-            await browser.close();
+            await context.close();
 
             console.log('3. Sending extracted Yad2 data to Google Apps Script (Sheets + Telegram)...');
             const postRes = await fetch(gasUrl, {
