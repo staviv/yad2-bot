@@ -7,7 +7,6 @@ on:
 
 jobs:
   scan-yad2:
-    # שימוש ב-ubuntu-24.04 ספציפי כדי למנוע את הערת המעבר של ubuntu-latest ב-GitHub Actions
     runs-on: ubuntu-24.04
     timeout-minutes: 10
 
@@ -20,34 +19,47 @@ jobs:
           sleep $DELAY
 
       - name: 📦 Setup Node.js 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: '24'
 
       - name: 🕵️ Cache CloakBrowser Binary & Persistent Profile
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cloakbrowser
             ./yad2-profile
-          key: cloakbrowser-yad2-v1-${{ runner.os }}
+          key: cloakbrowser-yad2-v2-${{ runner.os }}
           restore-keys: |
+            cloakbrowser-yad2-v2-
             cloakbrowser-yad2-v1-
 
       - name: 🌐 Install CloakBrowser (C++ Patched Stealth Chromium) & Xvfb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
+          # ניקוי רפוזיטורי צד-שלישי ב-Runner כדי ש-apt-get update לא ייכשל בגלל תקלות זמניות בשרתי מיקרוסופט/אובונטו
+          sudo rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources || true
+          sudo apt-get update -o Acquire::Retries=3 || true
+          sudo apt-get install -y --no-install-recommends xvfb xauth libgbm1 libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libpango-1.0-0 libcairo2 libasound2t64 fonts-noto-core || sudo apt-get install -y xvfb
+
           npm init -y
           npm install cloakbrowser playwright-core
-          npx playwright install-deps chromium
-          npx cloakbrowser install
+          npx playwright-core install-deps chromium || true
+
+          # אם בינארי הדפדפן כבר קיים מה-Cache, אין צורך להוריד 535MB מחדש (מונע חסימת Rate Limit של GitHub Releases)
+          if [ -d "$HOME/.cloakbrowser" ] && [ -n "$(find "$HOME/.cloakbrowser" -type f -executable 2>/dev/null)" ]; then
+            echo "✅ CloakBrowser binary already restored from cache! Skipping download."
+          else
+            echo "⬇️ Downloading CloakBrowser binary..."
+            npx cloakbrowser install || { sleep 5 && npx cloakbrowser install; }
+          fi
 
       - name: 🔍 Scrape Yad2 with CloakBrowser & Push to Google Apps Script
         env:
           GAS_WEB_APP_URL: ${{ secrets.GAS_WEB_APP_URL || 'https://script.google.com/macros/s/AKfycby2MJGz3Bq8fJJUtL8r0gWuJGa9I9H-1AaannsZuDyakbSIdq38wYpZrXIrRheMdshUgw/exec' }}
-          # אופציונלי: אם תרצה להשתמש ב-Proxy מותאם אישית, ניתן להגדיר ב-GitHub Secrets תחת PROXY_URL
           PROXY_URL: ${{ secrets.PROXY_URL || '' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cat << 'EOF' > scan_yad2.mjs
           import { launchPersistentContext } from 'cloakbrowser';
@@ -135,7 +147,7 @@ jobs:
               return;
             }
 
-            console.log('2. Launching CloakBrowser (C++ Stealth Chromium 146) inside Xvfb...');
+            console.log('2. Launching CloakBrowser (C++ Stealth Chromium) inside Xvfb...');
             const launchOpts = {
               userDataDir: './yad2-profile',
               headless: false,
@@ -171,7 +183,7 @@ jobs:
             const page = await context.newPage();
             const pagesPayload = [];
 
-            // Warm-up on a low-sensitivity page first (Tip 06 from CloakBrowser docs for ShieldSquare)
+            // Warm-up on a low-sensitivity page first
             try {
               console.log('Warm-up visit to yad2.co.il...');
               await page.goto('https://www.yad2.co.il/', { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -227,3 +239,4 @@ jobs:
           EOF
 
           xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node scan_yad2.mjs
+
