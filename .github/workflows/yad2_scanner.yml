@@ -88,6 +88,8 @@ jobs:
                   return {
                     name: searchItem.name,
                     url: searchItem.url,
+                    minPrice: searchItem.minPrice || null,
+                    maxPrice: searchItem.maxPrice || null,
                     nextData: JSON.parse(state.content)
                   };
                 }
@@ -95,6 +97,8 @@ jobs:
                   return {
                     name: searchItem.name,
                     url: searchItem.url,
+                    minPrice: searchItem.minPrice || null,
+                    maxPrice: searchItem.maxPrice || null,
                     html: state.content
                   };
                 }
@@ -111,6 +115,8 @@ jobs:
             return {
               name: searchItem.name,
               url: searchItem.url,
+              minPrice: searchItem.minPrice || null,
+              maxPrice: searchItem.maxPrice || null,
               error: isShieldSquare
                 ? `Yad2 ShieldSquare blocked GitHub Azure IP (Page title: ${finalTitle})`
                 : `No __NEXT_DATA__ found (Page title: ${finalTitle})`
@@ -190,6 +196,8 @@ jobs:
                 pagesPayload.push({
                   name: s.name,
                   url: s.url,
+                  minPrice: s.minPrice || null,
+                  maxPrice: s.maxPrice || null,
                   error: err.message
                 });
               }
