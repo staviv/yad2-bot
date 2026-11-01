@@ -236,7 +236,4 @@ jobs:
             console.error('Fatal error:', err);
             process.exit(1);
           });
-          EOF
-
-          xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node scan_yad2.mjs
-
+          
