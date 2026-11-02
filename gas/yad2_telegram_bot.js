@@ -726,6 +726,72 @@ function doGet(e) {
       })).setMimeType(ContentService.MimeType.JSON);
     }
 
+    if (action === 'diagnostics') {
+      const triggers = ScriptApp.getProjectTriggers().map(function(t) {
+        return {
+          id: t.getUniqueId(),
+          handler: t.getHandlerFunction(),
+          eventType: String(t.getEventType())
+        };
+      });
+      const allProps = PropertiesService.getScriptProperties().getProperties();
+      const safeProps = {};
+      for (const k in allProps) {
+        if (k.indexOf('TOKEN') !== -1 || k.indexOf('KEY') !== -1) {
+          safeProps[k] = allProps[k] ? (allProps[k].slice(0, 4) + '...' + allProps[k].slice(-4) + ' (len: ' + allProps[k].length + ')') : '(empty)';
+        } else {
+          safeProps[k] = allProps[k];
+        }
+      }
+      const ss = getSpreadsheet_();
+      const logSheet = ss.getSheetByName(CONFIG.SHEETS.LOGS);
+      const recentLogs = [];
+      if (logSheet) {
+        const lastRow = logSheet.getLastRow();
+        const startRow = Math.max(2, lastRow - 25);
+        if (lastRow >= 2) {
+          const logData = logSheet.getRange(startRow, 1, lastRow - startRow + 1, 3).getValues();
+          for (let i = logData.length - 1; i >= 0; i--) {
+            recentLogs.push({
+              time: logData[i][0],
+              type: logData[i][1],
+              details: logData[i][2]
+            });
+          }
+        }
+      }
+      return ContentService.createTextOutput(JSON.stringify({
+        ok: true,
+        serverTime: new Date().toISOString(),
+        israelTime: formatIsraelTime_(new Date()),
+        nextRunTime: getProp_('NEXT_RUN_TIME'),
+        spreadsheetUrl: ss.getUrl(),
+        triggers: triggers,
+        properties: safeProps,
+        recentLogs: recentLogs
+      }, null, 2)).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    if (action === 'reset_schedule') {
+      const resSched = scheduleNextRun_();
+      return ContentService.createTextOutput(JSON.stringify({
+        ok: true,
+        resSched: resSched,
+        nextRunTime: getProp_('NEXT_RUN_TIME'),
+        israelTime: formatIsraelTime_(new Date(getProp_('NEXT_RUN_TIME')))
+      }, null, 2)).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    if (action === 'trigger_scan') {
+      const ghRes = triggerGitHubActionsWorkflow_(false);
+      scheduleNextRun_();
+      return ContentService.createTextOutput(JSON.stringify({
+        ok: true,
+        ghDispatch: ghRes,
+        nextRunTime: getProp_('NEXT_RUN_TIME')
+      }, null, 2)).setMimeType(ContentService.MimeType.JSON);
+    }
+
     if (action === 'searches') {
       const searches = getCachedActiveSearches_();
       const globalLimits = getGlobalPriceLimits_();
@@ -1173,6 +1239,7 @@ function runYad2Scanner(isScheduledTrigger) {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(10000)) {
     logEvent_('SKIP', 'סריקה אחרת כבר רצה כעת. מדלג על ריצה זו.');
+    scheduleNextRun_();
     return;
   }
 
@@ -1200,15 +1267,19 @@ function triggeredScannerHandler() {
 }
 
 // ============================================================================
-// ⏱️ מנגנון תזמון אקראי (20 דקות בממוצע ± 10 דקות = 10 עד 30 דקות)
+// ⏱️ מנגנון תזמון אקראי (20 דקות בממוצע ± 10 דקות = 10 עד 30 דקות) + וואצ'דוג
 // ============================================================================
 
 function scheduleNextRun_() {
   try {
     const triggers = ScriptApp.getProjectTriggers();
+    let hasWatchdog = false;
     for (let i = 0; i < triggers.length; i++) {
-      if (triggers[i].getHandlerFunction() === 'triggeredScannerHandler') {
+      const fn = triggers[i].getHandlerFunction();
+      if (fn === 'triggeredScannerHandler') {
         ScriptApp.deleteTrigger(triggers[i]);
+      } else if (fn === 'watchdogScannerHandler') {
+        hasWatchdog = true;
       }
     }
 
@@ -1218,15 +1289,39 @@ function scheduleNextRun_() {
     const nextRunDate = new Date(Date.now() + randomDelayMs);
     const delayMinutes = (randomDelayMs / 60000).toFixed(1);
 
-    ScriptApp.newTrigger('triggeredScannerHandler')
+    const t1 = ScriptApp.newTrigger('triggeredScannerHandler')
       .timeBased()
       .at(nextRunDate)
       .create();
 
+    let t2 = null;
+    if (!hasWatchdog) {
+      t2 = ScriptApp.newTrigger('watchdogScannerHandler')
+        .timeBased()
+        .everyMinutes(30)
+        .create();
+    }
+
     setProp_('NEXT_RUN_TIME', nextRunDate.toISOString());
     logEvent_('SCHEDULE', 'הסריקה הבאה תוזמנה לעוד ' + delayMinutes + ' דקות (' + formatIsraelTime_(nextRunDate) + ')');
+    return { success: true, t1: t1 ? t1.getUniqueId() : null, t2: t2 ? t2.getUniqueId() : null };
   } catch (err) {
     logEvent_('SCHEDULE_ERR', 'שגיאה ביצירת טריגר המשך: ' + err.message);
+    return { success: false, error: err.message, stack: err.stack };
+  }
+}
+
+function watchdogScannerHandler() {
+  try {
+    const nextRunIso = getProp_('NEXT_RUN_TIME');
+    const now = Date.now();
+    // אם עברו מעל 10 דקות ממועד הסריקה המתוכנן והטריגר לא ירה - הטריגר נתקע במערכת של גוגל
+    if (!nextRunIso || (new Date(nextRunIso).getTime() < now - 10 * 60 * 1000)) {
+      logEvent_('WATCHDOG_HEAL', 'הטריגר המתוזמן נתקע (' + (nextRunIso || 'ללא תאריך') + '). הוואצ\'דוג מפעיל סריקה ומתזמן מחדש.');
+      runYad2Scanner(true);
+    }
+  } catch (e) {
+    console.error('Watchdog error: ' + e.message);
   }
 }
 
@@ -1235,7 +1330,7 @@ function stopBotSchedule() {
   let removed = 0;
   for (let i = 0; i < triggers.length; i++) {
     const fn = triggers[i].getHandlerFunction();
-    if (fn === 'triggeredScannerHandler' || fn === 'checkTelegramCommandsTrigger') {
+    if (fn === 'triggeredScannerHandler' || fn === 'checkTelegramCommandsTrigger' || fn === 'watchdogScannerHandler') {
       ScriptApp.deleteTrigger(triggers[i]);
       removed++;
     }
@@ -2081,8 +2176,13 @@ function sendStatusMessageWithButtons_(chatId, messageId) {
   const searches = getCachedActiveSearches_(ss);
   const aptSheet = ss.getSheetByName(CONFIG.SHEETS.APARTMENTS);
   const seenCount = aptSheet ? Math.max(0, aptSheet.getLastRow() - 1) : (parseInt(getProp_('CACHED_APARTMENTS_COUNT') || '0', 10) || 0);
-  const nextRunIso = getProp_('NEXT_RUN_TIME');
-  const nextRunText = nextRunIso ? formatIsraelTime_(new Date(nextRunIso)) : 'טרם נקבע';
+  let nextRunIso = getProp_('NEXT_RUN_TIME');
+  // שחזור עצמי (Self-Healing): אם המועד בעבר מעל 5 דקות - הטריגר נתקע, מתזמנים מחדש במקום
+  if (!nextRunIso || (new Date(nextRunIso).getTime() < Date.now() - 5 * 60 * 1000)) {
+    scheduleNextRun_();
+    nextRunIso = getProp_('NEXT_RUN_TIME');
+  }
+  const nextRunText = nextRunIso ? formatIsraelTime_(new Date(nextRunIso)) : 'מתזמן כעת...';
   const globalLimits = getGlobalPriceLimits_();
   const roomsLimits = getGlobalRoomsLimits_();
   const activeTarget = getChatId_() || chatId;
@@ -2608,6 +2708,7 @@ function handleTelegramCallbackQuery_(cb) {
 
 function triggerScanAndReply_(chatId) {
   const ghRes = triggerGitHubActionsWorkflow_(true);
+  scheduleNextRun_();
   if (ghRes.triggered) {
     sendTelegramText_(chatId, '🚀 *סריקת ענן ב-GitHub Actions הופעלה בהצלחה!*\nדירות חדשות יישלחו לכאן תוך כדקה.');
   } else {

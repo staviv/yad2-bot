@@ -9,6 +9,8 @@ jobs:
   scan-yad2:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      CLOAKBROWSER_LICENSE_KEY: ${{ secrets.CLOAKBROWSER_LICENSE_KEY }}
 
     steps:
       - name: ⏱️ Random Jitter (Up to 180s when triggered by Cron)
@@ -39,6 +41,7 @@ jobs:
       - name: 🌐 Install CloakBrowser (C++ Patched Stealth Chromium) & Xvfb
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLOAKBROWSER_LICENSE_KEY: ${{ secrets.CLOAKBROWSER_LICENSE_KEY }}
         run: |
           # ניקוי רפוזיטורי צד-שלישי ב-Runner כדי ש-apt-get update לא ייכשל בגלל תקלות זמניות בשרתי מיקרוסופט/אובונטו
           sudo rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources || true
