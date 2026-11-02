@@ -643,6 +643,7 @@ function processIngestedYad2Payload_(payload) {
     const searchStats = [];
     const activeSearches = getActiveSearchUrls_(ss);
     const globalPriceLimits = getGlobalPriceLimits_();
+    const globalRoomsLimits = getGlobalRoomsLimits_();
 
     let totalFilteredOutByPrice = 0;
     const pages = Array.isArray(payload.pages) ? payload.pages : [payload];
@@ -674,7 +675,7 @@ function processIngestedYad2Payload_(payload) {
         const candidate = extractedRaw[r];
         if (!candidate || !candidate.token) continue;
 
-        if (isListingMatchingPriceLimits_(candidate, effectiveLimits)) {
+        if (isListingMatchingPriceLimits_(candidate, effectiveLimits) && isListingMatchingRoomsLimits_(candidate, globalRoomsLimits)) {
           extracted.push(candidate);
         } else {
           pageFilteredByPrice++;
@@ -908,6 +909,109 @@ function formatPriceFilterSummary_(limits) {
     return 'עד ₪' + limits.maxPrice.toLocaleString('en-US');
   }
   return 'מ-₪' + limits.minPrice.toLocaleString('en-US');
+}
+
+// ============================================================================
+// 🛏️ סינון גלובלי לפי מספר חדרים (מ-עד), חל על כל החיפושים
+// ============================================================================
+
+function getGlobalRoomsLimits_() {
+  const props = PropertiesService.getScriptProperties();
+  const minProp = parseFloat(props.getProperty('GLOBAL_MIN_ROOMS') || '');
+  const maxProp = parseFloat(props.getProperty('GLOBAL_MAX_ROOMS') || '');
+  return {
+    minRooms: (!isNaN(minProp) && minProp > 0) ? minProp : 0,
+    maxRooms: (!isNaN(maxProp) && maxProp > 0) ? maxProp : 0
+  };
+}
+
+function setGlobalRoomsLimits_(minRooms, maxRooms) {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('GLOBAL_MIN_ROOMS', String(minRooms > 0 ? minRooms : 0));
+  props.setProperty('GLOBAL_MAX_ROOMS', String(maxRooms > 0 ? maxRooms : 0));
+}
+
+function applyRoomsParamToYad2Url_(rawUrl, limits) {
+  let url = String(rawUrl || '');
+  if (!url || !limits || (!limits.minRooms && !limits.maxRooms)) return url;
+  url = url.replace(/([?&])rooms=[^&]*&?/i, '$1').replace(/[?&]$/, '');
+  const minR = limits.minRooms > 0 ? limits.minRooms : 1;
+  const maxR = limits.maxRooms > 0 ? limits.maxRooms : 12;
+  return url + (url.indexOf('?') === -1 ? '?' : '&') + 'rooms=' + minR + '-' + maxR;
+}
+
+function isListingMatchingRoomsLimits_(item, limits) {
+  if (!limits || (!limits.minRooms && !limits.maxRooms)) return true;
+  const m = String(item.rooms === undefined || item.rooms === null ? '' : item.rooms).match(/\d+(?:\.\d+)?/);
+  if (!m) return true; // מספר חדרים לא ידוע - לא מסננים
+  const rooms = parseFloat(m[0]);
+  if (limits.minRooms > 0 && rooms < limits.minRooms) return false;
+  if (limits.maxRooms > 0 && rooms > limits.maxRooms) return false;
+  return true;
+}
+
+function formatRoomsFilterSummary_(limits) {
+  if (!limits || (!limits.minRooms && !limits.maxRooms)) return 'ללא הגבלה';
+  if (limits.minRooms > 0 && limits.maxRooms > 0) return limits.minRooms + ' עד ' + limits.maxRooms + ' חדרים';
+  if (limits.maxRooms > 0) return 'עד ' + limits.maxRooms + ' חדרים';
+  return 'מ-' + limits.minRooms + ' חדרים';
+}
+
+function sendRoomsMenu_(chatId) {
+  const text =
+    '🛏️ *סינון לפי מספר חדרים*\n\n' +
+    'טווח נוכחי: *' + escapeMarkdown_(formatRoomsFilterSummary_(getGlobalRoomsLimits_())) + '*\n\n' +
+    'בחרו טווח מוכן, או הקלידו טווח משלכם (למשל `2.5-3.5`). הטווח יחול על כל החיפושים:';
+  const inlineKeyboard = {
+    inline_keyboard: [
+      [
+        { text: '2 – 3', callback_data: 'SET_ROOMS_2_3' },
+        { text: '2.5 – 3.5', callback_data: 'SET_ROOMS_2.5_3.5' },
+        { text: '3 – 4', callback_data: 'SET_ROOMS_3_4' }
+      ],
+      [
+        { text: '3.5 – 4.5', callback_data: 'SET_ROOMS_3.5_4.5' },
+        { text: '4 – 5', callback_data: 'SET_ROOMS_4_5' },
+        { text: '5+', callback_data: 'SET_ROOMS_5_0' }
+      ],
+      [
+        { text: '✍️ טווח מותאם אישית', callback_data: 'ROOMS_CUSTOM_PROMPT' },
+        { text: '🔓 ללא הגבלה', callback_data: 'SET_ROOMS_0_0' }
+      ],
+      [
+        { text: '🔙 חזרה לתפריט הראשי', callback_data: 'MENU_MAIN' }
+      ]
+    ]
+  };
+  return sendTelegramText_(chatId, text, inlineKeyboard);
+}
+
+function handleRoomsCommandFromTelegram_(chatId, arg) {
+  arg = String(arg || '').trim().replace(/,/g, '.');
+  if (!arg) { sendRoomsMenu_(chatId); return; }
+  if (/^(off|0|clear|ללא|בטל)$/i.test(arg)) {
+    setGlobalRoomsLimits_(0, 0);
+    sendInteractiveMainMenu_(chatId, '✅ *סינון החדרים בוטל!*');
+    return;
+  }
+  const range = arg.match(/^(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)$/);
+  if (range) {
+    const mn = parseFloat(range[1]), mx = parseFloat(range[2]);
+    if (mx >= mn) {
+      setGlobalRoomsLimits_(mn, mx);
+      logEvent_('ROOMS_LIMIT', 'עודכן טווח חדרים: ' + mn + '-' + mx);
+      sendInteractiveMainMenu_(chatId, '✅ *טווח החדרים עודכן: ' + mn + ' – ' + mx + ' חדרים (חל על כל החיפושים)!*');
+      return;
+    }
+  }
+  const single = arg.match(/^(\d+(?:\.\d+)?)$/);
+  if (single) {
+    const v = parseFloat(single[1]);
+    setGlobalRoomsLimits_(v, v);
+    sendInteractiveMainMenu_(chatId, '✅ *סינון החדרים עודכן: ' + v + ' חדרים בלבד!*');
+    return;
+  }
+  sendRoomsMenu_(chatId);
 }
 
 // ============================================================================
@@ -1429,7 +1533,7 @@ function getActiveSearchUrls_(ss) {
         ? sheetMaxPrice
         : (urlLimits.maxPrice > 0 ? urlLimits.maxPrice : (globalLimits.maxPrice > 0 ? globalLimits.maxPrice : 0));
 
-      const finalUrl = applyPriceParamsToYad2Url_(rawUrl, minPrice, maxPrice);
+      const finalUrl = applyRoomsParamToYad2Url_(applyPriceParamsToYad2Url_(rawUrl, minPrice, maxPrice), getGlobalRoomsLimits_());
 
       activeSearches.push({
         rowIndex: i + 2,
@@ -1564,6 +1668,9 @@ function getMainMenuInlineKeyboard_() {
       [
         { text: '💰 הגדרת מחיר מקסימלי', callback_data: 'MENU_PRICE' },
         { text: '➕ הוספת אזור בלחיצה', callback_data: 'MENU_PRESETS' }
+      ],
+      [
+        { text: '🛏️ סינון לפי מספר חדרים', callback_data: 'MENU_ROOMS' }
       ],
       [
         { text: '👥 קבע צ\'אט זה להתראות', callback_data: 'ACT_SETGROUP' }
@@ -1732,6 +1839,9 @@ function sendPriceMenu_(chatId) {
       [
         { text: '✍️ הקלדת מחיר או טווח מותאם אישית', callback_data: 'PRICE_CUSTOM_PROMPT' },
         { text: '🔓 ללא הגבלת מחיר', callback_data: 'SET_PRICE_0' }
+      ],
+      [
+        { text: '🛏️ סינון לפי מספר חדרים', callback_data: 'MENU_ROOMS' }
       ],
       [
         { text: '🔙 חזרה לתפריט הראשי', callback_data: 'MENU_MAIN' }
@@ -1916,6 +2026,11 @@ function handleTelegramUpdateObject_(update) {
     handlePriceCommandFromTelegram_(chatId, '/price ' + rawText);
     return;
   }
+  if (awaitingInput === 'ROOMS' && rawText.indexOf('/') !== 0) {
+    props.deleteProperty('AWAITING_INPUT_' + chatId);
+    handleRoomsCommandFromTelegram_(chatId, rawText);
+    return;
+  }
   if (awaitingInput === 'BBOX' && rawText.indexOf('/') !== 0) {
     const coords = parseBBoxCoordsFromTextOrUrl_(rawText);
     if (coords) {
@@ -1961,6 +2076,10 @@ function handleTelegramUpdateObject_(update) {
       } else {
         sendPriceMenu_(chatId);
       }
+      return;
+    }
+    if (cmd === 'rooms') {
+      handleRoomsCommandFromTelegram_(chatId, arg);
       return;
     }
     if (cmd === 'scan') {
@@ -2051,6 +2170,25 @@ function handleTelegramCallbackQuery_(cb) {
   }
   if (data === 'MENU_PRICE') {
     sendPriceMenu_(chatId);
+    return;
+  }
+  if (data === 'MENU_ROOMS') {
+    sendRoomsMenu_(chatId);
+    return;
+  }
+  if (data.indexOf('SET_ROOMS_') === 0) {
+    const parts = data.replace('SET_ROOMS_', '').split('_');
+    const mn = parseFloat(parts[0]) || 0;
+    const mx = parseFloat(parts[1]) || 0;
+    setGlobalRoomsLimits_(mn, mx);
+    sendInteractiveMainMenu_(chatId, (mn || mx)
+      ? '✅ *טווח החדרים עודכן: ' + escapeMarkdown_(formatRoomsFilterSummary_({ minRooms: mn, maxRooms: mx })) + ' (חל על כל החיפושים)!*'
+      : '✅ *סינון החדרים בוטל!*');
+    return;
+  }
+  if (data === 'ROOMS_CUSTOM_PROMPT') {
+    props.setProperty('AWAITING_INPUT_' + chatId, 'ROOMS');
+    sendTelegramText_(chatId, '✍️ כתבו עכשיו טווח חדרים, למשל `2.5-3.5` (או מספר בודד, או `0` לביטול):');
     return;
   }
   if (data === 'MENU_STATUS') {
