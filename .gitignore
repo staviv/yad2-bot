@@ -1,0 +1,15 @@
+# Credentials & Secrets (NEVER COMMIT)
+.clasprc.json
+client_secret*.json
+creds.json
+.env
+.env.*
+
+# Local Agent Skills (Keep local, do not push to public repo)
+.agent/
+
+# Dependencies & Runtime
+node_modules/
+yad2-profile/
+scan_yad2.mjs
+package-lock.json
