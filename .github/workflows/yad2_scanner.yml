@@ -59,6 +59,7 @@ jobs:
         env:
           GAS_WEB_APP_URL: ${{ secrets.GAS_WEB_APP_URL || 'https://script.google.com/macros/s/AKfycby2MJGz3Bq8fJJUtL8r0gWuJGa9I9H-1AaannsZuDyakbSIdq38wYpZrXIrRheMdshUgw/exec' }}
           PROXY_URL: ${{ secrets.PROXY_URL || '' }}
+          CLOAKBROWSER_LICENSE_KEY: ${{ secrets.CLOAKBROWSER_LICENSE_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cat << 'EOF' > scan_yad2.mjs
