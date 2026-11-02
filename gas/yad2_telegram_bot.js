@@ -79,6 +79,67 @@ const REPLY_BTN = {
   STATUS: '📊 סטטוס וגיליון'
 };
 
+// זיכרון מטמון (In-Memory Cache) למשך ריצה בודדת למניעת קריאות כפולות ל-SpreadsheetApp ול-PropertiesService
+let _cachedSs = null;
+let _cachedPropsMap = null;
+let _cachedActiveSearches = null;
+
+function getPropsMap_() {
+  if (!_cachedPropsMap) {
+    try {
+      _cachedPropsMap = PropertiesService.getScriptProperties().getProperties() || {};
+    } catch (e) {
+      _cachedPropsMap = {};
+    }
+  }
+  return _cachedPropsMap;
+}
+
+function getProp_(key) {
+  const map = getPropsMap_();
+  return map[key] !== undefined ? map[key] : null;
+}
+
+function setProp_(key, val) {
+  const strVal = String(val === undefined || val === null ? '' : val);
+  const map = getPropsMap_();
+  if (map[key] === strVal) return;
+  map[key] = strVal;
+  try {
+    PropertiesService.getScriptProperties().setProperty(key, strVal);
+  } catch (e) {}
+}
+
+function setPropsBatch_(obj) {
+  const map = getPropsMap_();
+  let changed = false;
+  const toSave = {};
+  const keys = Object.keys(obj);
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
+    const v = String(obj[k] === undefined || obj[k] === null ? '' : obj[k]);
+    if (map[k] !== v) {
+      map[k] = v;
+      toSave[k] = v;
+      changed = true;
+    }
+  }
+  if (changed) {
+    try {
+      PropertiesService.getScriptProperties().setProperties(toSave, false);
+    } catch (e) {}
+  }
+}
+
+function deleteProp_(key) {
+  const map = getPropsMap_();
+  if (map[key] === undefined) return;
+  delete map[key];
+  try {
+    PropertiesService.getScriptProperties().deleteProperty(key);
+  } catch (e) {}
+}
+
 // ============================================================================
 // 🚀 פונקציות התקנה, בדיקה והפעלה ראשונית (להרצה ידנית מעורך הסקריפט)
 // ============================================================================
@@ -87,25 +148,25 @@ function setupBot() {
   const ss = getSpreadsheet_();
   initSheets_(ss);
   ensureExtendedSearchAreas_(ss);
+  invalidateSearchesCache_();
+  getActiveSearchUrls_(ss);
   clearProxySettings();
   logEvent_('SETUP', 'המערכת אותחלה בהצלחה והגיליונות עודכנו.');
-
-  // ניתוק Webhook ישן כדי ש-getUpdates יעבוד חלק ובמהירות (וייעזר ב-Webhook אם קיים WEB_APP_URL)
-  deleteTelegramWebhook();
 
   // רישום תפריט הפקודות בטלגרם
   setTelegramBotCommands_();
 
-  // הפעלת טריגר בדיקת הודעות ולחיצות כפתורים כל דקה
-  setupTelegramPollingTrigger_();
-
-  // קריאת הודעות ולחיצות כפתורים ממתינות בטלגרם
-  pollTelegramUpdates_();
+  // חיבור מהיר בזמן אמת (Webhook) אם מוגדר WEB_APP_URL, אחרת fallback ל-Polling
+  const webhookRes = ensureTelegramWebhook_(true);
+  if (!webhookRes.ok) {
+    setupTelegramPollingTrigger_();
+    pollTelegramUpdates_();
+  }
 
   // אם כבר יש Chat ID שמור, נשלח אליו מיד את התפריט האינטראקטיבי החדש עם הכפתורים!
   const chatId = getChatId_();
   if (chatId) {
-    sendInteractiveMainMenu_(chatId, '🎉 *הבוט עודכן לממשק כפתורים אינטראקטיבי מלא!*\nבחרו פעולה מהכפתורים למטה:');
+    sendInteractiveMainMenu_(chatId, '🎉 *הבוט עודכן לממשק כפתורים אינטראקטיבי מלא ומהיר במיוחד!*\nבחרו פעולה מהכפתורים למטה:', null, true);
   }
 
   // הפעלת הריצה והתזמון האקראי (10-30 דקות)
@@ -215,16 +276,82 @@ function setTelegramBotCommands_() {
   } catch (e) {}
 }
 
+function getWebAppUrl_() {
+  const propUrl = (getProp_('WEB_APP_URL') || '').trim();
+  if (propUrl && propUrl.indexOf('https://script.google.com/macros/s/') === 0) return propUrl;
+  const cfgUrl = String(CONFIG.WEB_APP_URL || '').trim();
+  if (cfgUrl && cfgUrl.indexOf('https://script.google.com/macros/s/') === 0) return cfgUrl;
+  return '';
+}
+
+function ensureTelegramWebhook_(force) {
+  const token = getBotToken_();
+  const webAppUrl = getWebAppUrl_();
+  if (!token || token === 'YOUR_TELEGRAM_BOT_TOKEN_HERE' || !webAppUrl) {
+    return { ok: false, reason: 'MISSING_TOKEN_OR_URL' };
+  }
+
+  if (!force && getProp_('TELEGRAM_WEBHOOK_URL') === webAppUrl) {
+    return { ok: true, cached: true, url: webAppUrl };
+  }
+
+  try {
+    const res = UrlFetchApp.fetch('https://api.telegram.org/bot' + token + '/setWebhook', {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify({
+        url: webAppUrl,
+        allowed_updates: ['message', 'edited_message', 'callback_query', 'my_chat_member', 'channel_post'],
+        drop_pending_updates: false
+      }),
+      muteHttpExceptions: true
+    });
+    const body = JSON.parse(res.getContentText() || '{}');
+    if (res.getResponseCode() === 200 && body.ok) {
+      setProp_('TELEGRAM_WEBHOOK_URL', webAppUrl);
+      removeTelegramPollingTrigger_();
+      return { ok: true, url: webAppUrl, description: body.description || '' };
+    }
+    return { ok: false, status: res.getResponseCode(), details: res.getContentText() };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+function getTelegramWebhookInfo_() {
+  const token = getBotToken_();
+  if (!token || token === 'YOUR_TELEGRAM_BOT_TOKEN_HERE') return { ok: false, error: 'Missing token' };
+  try {
+    const res = UrlFetchApp.fetch('https://api.telegram.org/bot' + token + '/getWebhookInfo', { muteHttpExceptions: true });
+    return JSON.parse(res.getContentText() || '{}');
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+function removeTelegramPollingTrigger_() {
+  try {
+    const triggers = ScriptApp.getProjectTriggers();
+    for (let i = 0; i < triggers.length; i++) {
+      if (triggers[i].getHandlerFunction() === 'checkTelegramCommandsTrigger') {
+        ScriptApp.deleteTrigger(triggers[i]);
+      }
+    }
+  } catch (e) {}
+}
+
 function testTelegramConnection() {
   const token = getBotToken_();
   if (!token || token === 'YOUR_TELEGRAM_BOT_TOKEN_HERE') {
     throw new Error('❌ חסר TELEGRAM_BOT_TOKEN! הזן את הטוקן שקיבלת מ-@BotFather בקובץ ושמור (Ctrl+S).');
   }
 
-  UrlFetchApp.fetch('https://api.telegram.org/bot' + token + '/deleteWebhook', { muteHttpExceptions: true });
   setTelegramBotCommands_();
-  setupTelegramPollingTrigger_();
-  pollTelegramUpdates_();
+  const webhookRes = ensureTelegramWebhook_(true);
+  if (!webhookRes.ok) {
+    setupTelegramPollingTrigger_();
+    pollTelegramUpdates_();
+  }
 
   const chatId = getChatId_();
   if (!chatId) {
@@ -233,19 +360,16 @@ function testTelegramConnection() {
 
   sendInteractiveMainMenu_(
     chatId,
-    '✅ *החיבור לטלגרם ול-Google Sheets תקין ופעיל!*\n' +
-    'כל הפעולות זמינות כעת בלחיצת כפתור מתוך התפריט למטה:'
+    '✅ *החיבור לטלגרם ול-Google Sheets תקין ופעיל (במצב תגובה מיידית)!*\n' +
+    'כל הפעולות זמינות כעת בלחיצת כפתור מתוך התפריט למטה:',
+    null,
+    true
   );
 }
 
 function setupTelegramPollingTrigger_() {
   try {
-    const triggers = ScriptApp.getProjectTriggers();
-    for (let i = 0; i < triggers.length; i++) {
-      if (triggers[i].getHandlerFunction() === 'checkTelegramCommandsTrigger') {
-        ScriptApp.deleteTrigger(triggers[i]);
-      }
-    }
+    removeTelegramPollingTrigger_();
     ScriptApp.newTrigger('checkTelegramCommandsTrigger')
       .timeBased()
       .everyMinutes(1)
@@ -257,15 +381,20 @@ function setupTelegramPollingTrigger_() {
 }
 
 function checkTelegramCommandsTrigger() {
+  if (getProp_('TELEGRAM_WEBHOOK_URL')) {
+    removeTelegramPollingTrigger_();
+    return;
+  }
   pollTelegramUpdates_();
 }
 
 function deleteTelegramWebhook() {
   const token = getBotToken_();
   if (!token || token === 'YOUR_TELEGRAM_BOT_TOKEN_HERE') return;
+  deleteProp_('TELEGRAM_WEBHOOK_URL');
   const apiUrl = 'https://api.telegram.org/bot' + token + '/deleteWebhook';
   const res = UrlFetchApp.fetch(apiUrl, { muteHttpExceptions: true });
-  logEvent_('WEBHOOK_DEL', 'Webhook של טלגרם נמחק (עובד במצב getUpdates אוטומטי): ' + res.getContentText());
+  logEvent_('WEBHOOK_DEL', 'Webhook של טלגרם נמחק: ' + res.getContentText());
 }
 
 // ============================================================================
@@ -417,6 +546,7 @@ function mergeActiveSearchesInSheet_(ss, mode) {
       maxPriceToKeep > 0 ? maxPriceToKeep : ''
     ]);
 
+    invalidateSearchesCache_();
     logEvent_('MERGE_BBOX_ALL', 'אוחדו ' + activeSearches.length + ' חיפושים לחיפוש bBox אחד: ' + unifiedUrl);
     return {
       merged: true,
@@ -500,6 +630,7 @@ function mergeActiveSearchesInSheet_(ss, mode) {
     }
   }
 
+  invalidateSearchesCache_();
   logEvent_('SMART_MERGE', 'בוצע איחוד חכם וניקוי bBox. הושבתו ' + deactivatedCount + ' חיפושים כפולים.');
   return {
     merged: true,
@@ -513,11 +644,10 @@ function mergeActiveSearchesInSheet_(ss, mode) {
 // ☁️ הפעלה אוטומטית של GitHub Actions מתוך Google Apps Script
 // ============================================================================
 
-function triggerGitHubActionsWorkflow_() {
-  const props = PropertiesService.getScriptProperties();
-  const repo = (props.getProperty('GITHUB_REPO') || CONFIG.GITHUB_REPO || '').trim();
-  const ghToken = (props.getProperty('GITHUB_TOKEN') || CONFIG.GITHUB_TOKEN || '').trim();
-  const workflowFile = (props.getProperty('GITHUB_WORKFLOW_FILE') || CONFIG.GITHUB_WORKFLOW_FILE || 'yad2_scanner.yml').trim();
+function triggerGitHubActionsWorkflow_(skipSheetLog) {
+  const repo = (getProp_('GITHUB_REPO') || CONFIG.GITHUB_REPO || '').trim();
+  const ghToken = (getProp_('GITHUB_TOKEN') || CONFIG.GITHUB_TOKEN || '').trim();
+  const workflowFile = (getProp_('GITHUB_WORKFLOW_FILE') || CONFIG.GITHUB_WORKFLOW_FILE || 'yad2_scanner.yml').trim();
 
   if (!repo || !ghToken) {
     return { triggered: false, reason: 'NO_GITHUB_CREDENTIALS' };
@@ -539,8 +669,10 @@ function triggerGitHubActionsWorkflow_() {
 
   const code = res.getResponseCode();
   if (code === 204 || code === 200) {
-    logEvent_('GITHUB_DISPATCH', 'הופעלה סריקת ענן ב-GitHub Actions (' + repo + ').');
-    return { triggered: true };
+    if (!skipSheetLog) {
+      logEvent_('GITHUB_DISPATCH', 'הופעלה סריקת ענן ב-GitHub Actions (' + repo + ').');
+    }
+    return { triggered: true, repo: repo };
   }
 
   if (code === 422) {
@@ -557,8 +689,10 @@ function triggerGitHubActionsWorkflow_() {
       muteHttpExceptions: true
     });
     if (resMaster.getResponseCode() === 204 || resMaster.getResponseCode() === 200) {
-      logEvent_('GITHUB_DISPATCH', 'הופעלה סריקת ענן ב-GitHub Actions (' + repo + ' [master]).');
-      return { triggered: true };
+      if (!skipSheetLog) {
+        logEvent_('GITHUB_DISPATCH', 'הופעלה סריקת ענן ב-GitHub Actions (' + repo + ' [master]).');
+      }
+      return { triggered: true, repo: repo };
     }
   }
 
@@ -573,11 +707,27 @@ function triggerGitHubActionsWorkflow_() {
 function doGet(e) {
   try {
     const action = (e && e.parameter && e.parameter.action) ? e.parameter.action : 'searches';
-    const ss = getSpreadsheet_();
-    initSheets_(ss);
+
+    if (action === 'setup_webhook') {
+      setTelegramBotCommands_();
+      const setRes = ensureTelegramWebhook_(true);
+      const infoRes = getTelegramWebhookInfo_();
+      return ContentService.createTextOutput(JSON.stringify({
+        ok: true,
+        setWebhook: setRes,
+        webhookInfo: infoRes
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    if (action === 'webhook_info') {
+      return ContentService.createTextOutput(JSON.stringify({
+        ok: true,
+        webhookInfo: getTelegramWebhookInfo_()
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
 
     if (action === 'searches') {
-      const searches = getActiveSearchUrls_(ss);
+      const searches = getCachedActiveSearches_();
       const globalLimits = getGlobalPriceLimits_();
       return ContentService.createTextOutput(JSON.stringify({
         ok: true,
@@ -600,8 +750,7 @@ function doGet(e) {
 function doPost(e) {
   try {
     if (!e || !e.postData || !e.postData.contents) {
-      return ContentService.createTextOutput(JSON.stringify({ ok: false, error: 'Empty payload' }))
-        .setMimeType(ContentService.MimeType.JSON);
+      return HtmlService.createHtmlOutput('OK');
     }
 
     const payload = JSON.parse(e.postData.contents);
@@ -613,16 +762,17 @@ function doPost(e) {
         .setMimeType(ContentService.MimeType.JSON);
     }
 
-    // ב. קליטת הודעות ולחיצות כפתורים מטלגרם:
-    if (payload.update_id || payload.message || payload.callback_query || payload.my_chat_member) {
+    // ב. קליטת הודעות ולחיצות כפתורים מטלגרם בזמן אמת (Webhook):
+    if (payload.update_id || payload.message || payload.callback_query || payload.my_chat_member || payload.channel_post) {
       handleTelegramUpdateObject_(payload);
+      // החזרת HtmlService מונעת הפניית 302 של ContentService ששרתי Webhook של טלגרם דוחים
+      return HtmlService.createHtmlOutput('OK');
     }
   } catch (err) {
-    logEvent_('POST_ERR', err.message);
-    return ContentService.createTextOutput(JSON.stringify({ ok: false, error: err.message }))
-      .setMimeType(ContentService.MimeType.JSON);
+    console.error('[POST_ERR] ' + err.message);
+    return HtmlService.createHtmlOutput('OK');
   }
-  return ContentService.createTextOutput('OK');
+  return HtmlService.createHtmlOutput('OK');
 }
 
 /**
@@ -767,9 +917,8 @@ function processIngestedYad2Payload_(payload) {
 // ============================================================================
 
 function getGlobalPriceLimits_() {
-  const props = PropertiesService.getScriptProperties();
-  const minProp = parseInt(props.getProperty('GLOBAL_MIN_PRICE') || '', 10);
-  const maxProp = parseInt(props.getProperty('GLOBAL_MAX_PRICE') || '', 10);
+  const minProp = parseInt(getProp_('GLOBAL_MIN_PRICE') || '', 10);
+  const maxProp = parseInt(getProp_('GLOBAL_MAX_PRICE') || '', 10);
 
   return {
     minPrice: (!isNaN(minProp) && minProp > 0) ? minProp : (CONFIG.DEFAULT_MIN_PRICE || 0),
@@ -778,9 +927,11 @@ function getGlobalPriceLimits_() {
 }
 
 function setGlobalPriceLimits_(minPrice, maxPrice) {
-  const props = PropertiesService.getScriptProperties();
-  props.setProperty('GLOBAL_MIN_PRICE', String(minPrice > 0 ? minPrice : 0));
-  props.setProperty('GLOBAL_MAX_PRICE', String(maxPrice > 0 ? maxPrice : 0));
+  setPropsBatch_({
+    GLOBAL_MIN_PRICE: String(minPrice > 0 ? minPrice : 0),
+    GLOBAL_MAX_PRICE: String(maxPrice > 0 ? maxPrice : 0)
+  });
+  invalidateSearchesCache_();
 }
 
 function extractPriceLimitsFromYad2Url_(url) {
@@ -916,9 +1067,8 @@ function formatPriceFilterSummary_(limits) {
 // ============================================================================
 
 function getGlobalRoomsLimits_() {
-  const props = PropertiesService.getScriptProperties();
-  const minProp = parseFloat(props.getProperty('GLOBAL_MIN_ROOMS') || '');
-  const maxProp = parseFloat(props.getProperty('GLOBAL_MAX_ROOMS') || '');
+  const minProp = parseFloat(getProp_('GLOBAL_MIN_ROOMS') || '');
+  const maxProp = parseFloat(getProp_('GLOBAL_MAX_ROOMS') || '');
   return {
     minRooms: (!isNaN(minProp) && minProp > 0) ? minProp : 0,
     maxRooms: (!isNaN(maxProp) && maxProp > 0) ? maxProp : 0
@@ -926,9 +1076,11 @@ function getGlobalRoomsLimits_() {
 }
 
 function setGlobalRoomsLimits_(minRooms, maxRooms) {
-  const props = PropertiesService.getScriptProperties();
-  props.setProperty('GLOBAL_MIN_ROOMS', String(minRooms > 0 ? minRooms : 0));
-  props.setProperty('GLOBAL_MAX_ROOMS', String(maxRooms > 0 ? maxRooms : 0));
+  setPropsBatch_({
+    GLOBAL_MIN_ROOMS: String(minRooms > 0 ? minRooms : 0),
+    GLOBAL_MAX_ROOMS: String(maxRooms > 0 ? maxRooms : 0)
+  });
+  invalidateSearchesCache_();
 }
 
 function applyRoomsParamToYad2Url_(rawUrl, limits) {
@@ -957,7 +1109,7 @@ function formatRoomsFilterSummary_(limits) {
   return 'מ-' + limits.minRooms + ' חדרים';
 }
 
-function sendRoomsMenu_(chatId) {
+function sendRoomsMenu_(chatId, messageId) {
   const text =
     '🛏️ *סינון לפי מספר חדרים*\n\n' +
     'טווח נוכחי: *' + escapeMarkdown_(formatRoomsFilterSummary_(getGlobalRoomsLimits_())) + '*\n\n' +
@@ -983,7 +1135,7 @@ function sendRoomsMenu_(chatId) {
       ]
     ]
   };
-  return sendTelegramText_(chatId, text, inlineKeyboard);
+  return editOrSendTelegramText_(chatId, messageId, text, inlineKeyboard);
 }
 
 function handleRoomsCommandFromTelegram_(chatId, arg) {
@@ -999,7 +1151,6 @@ function handleRoomsCommandFromTelegram_(chatId, arg) {
     const mn = parseFloat(range[1]), mx = parseFloat(range[2]);
     if (mx >= mn) {
       setGlobalRoomsLimits_(mn, mx);
-      logEvent_('ROOMS_LIMIT', 'עודכן טווח חדרים: ' + mn + '-' + mx);
       sendInteractiveMainMenu_(chatId, '✅ *טווח החדרים עודכן: ' + mn + ' – ' + mx + ' חדרים (חל על כל החיפושים)!*');
       return;
     }
@@ -1026,10 +1177,9 @@ function runYad2Scanner(isScheduledTrigger) {
   }
 
   try {
-    const ss = getSpreadsheet_();
-    initSheets_(ss);
-
-    pollTelegramUpdates_();
+    if (!getProp_('TELEGRAM_WEBHOOK_URL')) {
+      ensureTelegramWebhook_(false);
+    }
 
     const ghDispatch = triggerGitHubActionsWorkflow_();
     if (ghDispatch.triggered) {
@@ -1073,7 +1223,7 @@ function scheduleNextRun_() {
       .at(nextRunDate)
       .create();
 
-    PropertiesService.getScriptProperties().setProperty('NEXT_RUN_TIME', nextRunDate.toISOString());
+    setProp_('NEXT_RUN_TIME', nextRunDate.toISOString());
     logEvent_('SCHEDULE', 'הסריקה הבאה תוזמנה לעוד ' + delayMinutes + ' דקות (' + formatIsraelTime_(nextRunDate) + ')');
   } catch (err) {
     logEvent_('SCHEDULE_ERR', 'שגיאה ביצירת טריגר המשך: ' + err.message);
@@ -1410,19 +1560,74 @@ function extractListingsFromRawHtmlFallback_(html, sourceUrl) {
 // ============================================================================
 
 function getSpreadsheet_() {
+  if (_cachedSs) return _cachedSs;
+
   if (CONFIG.SPREADSHEET_ID && CONFIG.SPREADSHEET_ID.trim() !== '') {
-    return SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID.trim());
+    _cachedSs = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID.trim());
+    return _cachedSs;
+  }
+  const savedId = getProp_('CREATED_SPREADSHEET_ID');
+  if (savedId) {
+    try {
+      _cachedSs = SpreadsheetApp.openById(savedId);
+      return _cachedSs;
+    } catch (e) {}
   }
   const active = SpreadsheetApp.getActiveSpreadsheet();
-  if (active) return active;
-
-  const savedId = PropertiesService.getScriptProperties().getProperty('CREATED_SPREADSHEET_ID');
-  if (savedId) {
-    return SpreadsheetApp.openById(savedId);
+  if (active) {
+    setProp_('CREATED_SPREADSHEET_ID', active.getId());
+    _cachedSs = active;
+    return _cachedSs;
   }
+
   const newSs = SpreadsheetApp.create('בוט דירות יד 2 - מעקב והתראות');
-  PropertiesService.getScriptProperties().setProperty('CREATED_SPREADSHEET_ID', newSs.getId());
-  return newSs;
+  setProp_('CREATED_SPREADSHEET_ID', newSs.getId());
+  _cachedSs = newSs;
+  return _cachedSs;
+}
+
+function invalidateSearchesCache_() {
+  _cachedActiveSearches = null;
+  try {
+    CacheService.getScriptCache().remove('ACTIVE_SEARCHES_V2');
+  } catch (e) {}
+}
+
+function getCachedActiveSearches_(ssOptional) {
+  if (_cachedActiveSearches) return _cachedActiveSearches;
+  try {
+    const raw = CacheService.getScriptCache().get('ACTIVE_SEARCHES_V2');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        _cachedActiveSearches = parsed;
+        return parsed;
+      }
+    }
+  } catch (e) {}
+
+  const ss = ssOptional || getSpreadsheet_();
+  return getActiveSearchUrls_(ss);
+}
+
+function getCachedActiveSearchesCount_() {
+  if (_cachedActiveSearches) return _cachedActiveSearches.length;
+  try {
+    const raw = CacheService.getScriptCache().get('ACTIVE_SEARCHES_V2');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        _cachedActiveSearches = parsed;
+        return parsed.length;
+      }
+    }
+  } catch (e) {}
+
+  const propCount = parseInt(getProp_('ACTIVE_SEARCHES_COUNT') || '', 10);
+  if (!isNaN(propCount) && propCount >= 0) {
+    return propCount;
+  }
+  return getCachedActiveSearches_().length;
 }
 
 function initSheets_(ss) {
@@ -1506,13 +1711,19 @@ function initSheets_(ss) {
 
 function getActiveSearchUrls_(ss) {
   const sheet = ss.getSheetByName(CONFIG.SHEETS.SEARCHES);
+  if (!sheet) return [];
   const lastRow = sheet.getLastRow();
-  if (lastRow < 2) return [];
+  if (lastRow < 2) {
+    _cachedActiveSearches = [];
+    setProp_('ACTIVE_SEARCHES_COUNT', '0');
+    return [];
+  }
 
   const maxCols = Math.max(8, sheet.getLastColumn());
   const values = sheet.getRange(2, 1, lastRow - 1, maxCols).getValues();
   const activeSearches = [];
   const globalLimits = getGlobalPriceLimits_();
+  const globalRoomsLimits = getGlobalRoomsLimits_();
 
   for (let i = 0; i < values.length; i++) {
     const isActiveRaw = String(values[i][0] || '').trim().toLowerCase();
@@ -1533,7 +1744,7 @@ function getActiveSearchUrls_(ss) {
         ? sheetMaxPrice
         : (urlLimits.maxPrice > 0 ? urlLimits.maxPrice : (globalLimits.maxPrice > 0 ? globalLimits.maxPrice : 0));
 
-      const finalUrl = applyRoomsParamToYad2Url_(applyPriceParamsToYad2Url_(rawUrl, minPrice, maxPrice), getGlobalRoomsLimits_());
+      const finalUrl = applyRoomsParamToYad2Url_(applyPriceParamsToYad2Url_(rawUrl, minPrice, maxPrice), globalRoomsLimits);
 
       activeSearches.push({
         rowIndex: i + 2,
@@ -1545,6 +1756,13 @@ function getActiveSearchUrls_(ss) {
       });
     }
   }
+
+  _cachedActiveSearches = activeSearches;
+  setProp_('ACTIVE_SEARCHES_COUNT', String(activeSearches.length));
+  try {
+    CacheService.getScriptCache().put('ACTIVE_SEARCHES_V2', JSON.stringify(activeSearches), 600);
+  } catch (e) {}
+
   return activeSearches;
 }
 
@@ -1583,6 +1801,7 @@ function getSeenTokensMap_(ss) {
       if (t) seen[t] = true;
     }
   }
+  setProp_('CACHED_APARTMENTS_COUNT', String(Math.max(0, lastRow - 1)));
   return seen;
 }
 
@@ -1612,7 +1831,9 @@ function saveNewListingsToSheet_(ss, listings) {
   });
 
   if (rows.length > 0) {
-    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+    const prevLastRow = sheet.getLastRow();
+    sheet.getRange(prevLastRow + 1, 1, rows.length, rows[0].length).setValues(rows);
+    setProp_('CACHED_APARTMENTS_COUNT', String(Math.max(0, prevLastRow + rows.length - 1)));
   }
 }
 
@@ -1679,10 +1900,10 @@ function getMainMenuInlineKeyboard_() {
   };
 }
 
-function sendInteractiveMainMenu_(chatId, introText) {
-  const ss = getSpreadsheet_();
-  const searches = getActiveSearchUrls_(ss);
+function sendInteractiveMainMenu_(chatId, introText, messageId, forceReplyKeyboard) {
+  const searchesCount = getCachedActiveSearchesCount_();
   const globalLimits = getGlobalPriceLimits_();
+  const roomsLimits = getGlobalRoomsLimits_();
   const activeTarget = getChatId_() || chatId;
   const isTargetGroup = String(activeTarget).indexOf('-') === 0;
 
@@ -1690,18 +1911,21 @@ function sendInteractiveMainMenu_(chatId, introText) {
   const body =
     header + '\n\n' +
     '📍 *יעד התראות:* ' + (isTargetGroup ? 'קבוצה משותפת' : 'צ\'אט פרטי') + '\n' +
-    '🔍 *חיפושים פעילים:* ' + searches.length + '\n' +
-    '💰 *תקרת מחיר:* ' + escapeMarkdown_(formatPriceFilterSummary_(globalLimits)) + '\n\n' +
+    '🔍 *חיפושים פעילים:* ' + searchesCount + '\n' +
+    '💰 *תקרת מחיר:* ' + escapeMarkdown_(formatPriceFilterSummary_(globalLimits)) + '\n' +
+    '🛏️ *חדרים:* ' + escapeMarkdown_(formatRoomsFilterSummary_(roomsLimits)) + '\n\n' +
     '👇 *בחרו פעולה בלחיצה על הכפתורים (ללא צורך בפקודות):*';
 
-  // שולח גם את מקלדת הכפתורים התחתונה הקבועה וגם את התפריט עם כפתורי ה-Inline
-  sendTelegramText_(chatId, '⌨️ מקלדת הכפתורים המהירה הופעלה בתחתית המסך.', getPersistentReplyKeyboard_());
-  return sendTelegramText_(chatId, body, getMainMenuInlineKeyboard_());
+  const kbKey = 'KB_INIT_' + chatId;
+  if (forceReplyKeyboard || !getProp_(kbKey)) {
+    setProp_(kbKey, '1');
+    sendTelegramText_(chatId, '⌨️ מקלדת הכפתורים המהירה הופעלה בתחתית המסך.', getPersistentReplyKeyboard_());
+  }
+  return editOrSendTelegramText_(chatId, messageId, body, getMainMenuInlineKeyboard_());
 }
 
-function sendSearchesManagementMenu_(chatId) {
-  const ss = getSpreadsheet_();
-  const searches = getActiveSearchUrls_(ss);
+function sendSearchesManagementMenu_(chatId, messageId) {
+  const searches = getCachedActiveSearches_();
   const globalLimits = getGlobalPriceLimits_();
 
   let text = '📋 *ניהול ואיחוד חיפושים פעילים (' + searches.length + '):*\n';
@@ -1748,10 +1972,10 @@ function sendSearchesManagementMenu_(chatId) {
     { text: '🔙 חזרה לתפריט הראשי', callback_data: 'MENU_MAIN' }
   ]);
 
-  return sendTelegramText_(chatId, text, { inline_keyboard: inlineRows });
+  return editOrSendTelegramText_(chatId, messageId, text, { inline_keyboard: inlineRows });
 }
 
-function sendBBoxMenu_(chatId) {
+function sendBBoxMenu_(chatId, messageId) {
   const text =
     '🗺 *חיפוש מפה (bBox) נקי – ללא נעילת עיר או אזור!*\n\n' +
     'כאשר מחפשים ביד 2 לפי מפה (`bBox`), אם משאירים בקישור `area=` או `city=`, יד 2 מסנן החוצה מושבים ויישובים שלא רשומים תחת אותה עיר.\n' +
@@ -1781,10 +2005,10 @@ function sendBBoxMenu_(chatId) {
     ]
   };
 
-  return sendTelegramText_(chatId, text, inlineKeyboard);
+  return editOrSendTelegramText_(chatId, messageId, text, inlineKeyboard);
 }
 
-function sendPresetAreasMenu_(chatId) {
+function sendPresetAreasMenu_(chatId, messageId) {
   const text =
     '➕ *הוספת אזורי חיפוש מהירה בלחיצת כפתור:*\n\n' +
     'בחרו איזה אזור תרצו להוסיף למעקב (או הדביקו כל קישור מיד 2 ישירות בצ\'אט):';
@@ -1809,10 +2033,10 @@ function sendPresetAreasMenu_(chatId) {
     ]
   };
 
-  return sendTelegramText_(chatId, text, inlineKeyboard);
+  return editOrSendTelegramText_(chatId, messageId, text, inlineKeyboard);
 }
 
-function sendPriceMenu_(chatId) {
+function sendPriceMenu_(chatId, messageId) {
   const currentLimits = getGlobalPriceLimits_();
   const text =
     '💰 *הגדרת תקרת מחיר בלחיצת כפתור*\n\n' +
@@ -1849,16 +2073,18 @@ function sendPriceMenu_(chatId) {
     ]
   };
 
-  return sendTelegramText_(chatId, text, inlineKeyboard);
+  return editOrSendTelegramText_(chatId, messageId, text, inlineKeyboard);
 }
 
-function sendStatusMessageWithButtons_(chatId) {
+function sendStatusMessageWithButtons_(chatId, messageId) {
   const ss = getSpreadsheet_();
-  const searches = getActiveSearchUrls_(ss);
-  const seenCount = Object.keys(getSeenTokensMap_(ss)).length;
-  const nextRunIso = PropertiesService.getScriptProperties().getProperty('NEXT_RUN_TIME');
+  const searches = getCachedActiveSearches_(ss);
+  const aptSheet = ss.getSheetByName(CONFIG.SHEETS.APARTMENTS);
+  const seenCount = aptSheet ? Math.max(0, aptSheet.getLastRow() - 1) : (parseInt(getProp_('CACHED_APARTMENTS_COUNT') || '0', 10) || 0);
+  const nextRunIso = getProp_('NEXT_RUN_TIME');
   const nextRunText = nextRunIso ? formatIsraelTime_(new Date(nextRunIso)) : 'טרם נקבע';
   const globalLimits = getGlobalPriceLimits_();
+  const roomsLimits = getGlobalRoomsLimits_();
   const activeTarget = getChatId_() || chatId;
   const isTargetGroup = String(activeTarget).indexOf('-') === 0;
 
@@ -1867,6 +2093,7 @@ function sendStatusMessageWithButtons_(chatId) {
     '• יעד התראות: *' + (isTargetGroup ? 'קבוצה משותפת (' + activeTarget + ')' : 'צ\'אט פרטי (' + activeTarget + ')') + '*\n' +
     '• חיפושים פעילים: *' + searches.length + '*\n' +
     '• סינון מחיר גלובלי: *' + escapeMarkdown_(formatPriceFilterSummary_(globalLimits)) + '*\n' +
+    '• סינון חדרים גלובלי: *' + escapeMarkdown_(formatRoomsFilterSummary_(roomsLimits)) + '*\n' +
     '• דירות מתועדות בגיליון: *' + seenCount + '*\n' +
     '• הסריקה האוטומטית הבאה: *' + nextRunText + '*\n' +
     '• טווח תזמון אקראי: כל *' + CONFIG.MIN_INTERVAL_MINUTES + '-' + CONFIG.MAX_INTERVAL_MINUTES + ' דקות*';
@@ -1886,7 +2113,7 @@ function sendStatusMessageWithButtons_(chatId) {
     ]
   };
 
-  return sendTelegramText_(chatId, text, inlineKeyboard);
+  return editOrSendTelegramText_(chatId, messageId, text, inlineKeyboard);
 }
 
 // ============================================================================
@@ -1894,31 +2121,27 @@ function sendStatusMessageWithButtons_(chatId) {
 // ============================================================================
 
 function pollTelegramUpdates_() {
+  if (getProp_('TELEGRAM_WEBHOOK_URL')) return;
+
   const token = getBotToken_();
   if (!token || token === 'YOUR_TELEGRAM_BOT_TOKEN_HERE') return;
 
-  const props = PropertiesService.getScriptProperties();
-  const lastUpdateId = parseInt(props.getProperty('TELEGRAM_LAST_UPDATE_ID') || '0', 10);
+  const lastUpdateId = parseInt(getProp_('TELEGRAM_LAST_UPDATE_ID') || '0', 10);
   const url = 'https://api.telegram.org/bot' + token + '/getUpdates?offset=' + (lastUpdateId + 1) + '&timeout=1';
 
   try {
     const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
     if (res.getResponseCode() === 409) {
-      UrlFetchApp.fetch('https://api.telegram.org/bot' + token + '/deleteWebhook', { muteHttpExceptions: true });
+      // קיים Webhook פעיל - נשמור אותו ונסיר את טריגר ה-Polling כדי לא למחוק את ה-Webhook המהיר!
+      const webAppUrl = getWebAppUrl_();
+      if (webAppUrl) setProp_('TELEGRAM_WEBHOOK_URL', webAppUrl);
+      removeTelegramPollingTrigger_();
       return;
     }
     if (res.getResponseCode() !== 200) return;
 
     const data = JSON.parse(res.getContentText());
     if (!data.ok || !Array.isArray(data.result) || data.result.length === 0) return;
-
-    let maxUpdateId = lastUpdateId;
-    for (let i = 0; i < data.result.length; i++) {
-      if (data.result[i].update_id > maxUpdateId) {
-        maxUpdateId = data.result[i].update_id;
-      }
-    }
-    props.setProperty('TELEGRAM_LAST_UPDATE_ID', String(maxUpdateId));
 
     for (let j = 0; j < data.result.length; j++) {
       handleTelegramUpdateObject_(data.result[j]);
@@ -1927,6 +2150,15 @@ function pollTelegramUpdates_() {
 }
 
 function handleTelegramUpdateObject_(update) {
+  if (!update) return;
+
+  // מניעת עיבוד כפול של אותו update_id
+  if (update.update_id) {
+    const lastId = parseInt(getProp_('TELEGRAM_LAST_UPDATE_ID') || '0', 10);
+    if (update.update_id <= lastId) return;
+    setProp_('TELEGRAM_LAST_UPDATE_ID', String(update.update_id));
+  }
+
   // 1. קודם כל: טיפול בלחיצות על כפתורים אינטראקטיביים (Inline Keyboard Callback Query)
   if (update.callback_query) {
     handleTelegramCallbackQuery_(update.callback_query);
@@ -1939,13 +2171,15 @@ function handleTelegramUpdateObject_(update) {
     const newStatus = update.my_chat_member.new_chat_member && update.my_chat_member.new_chat_member.status;
     if ((memberChat.type === 'group' || memberChat.type === 'supergroup') && (newStatus === 'member' || newStatus === 'administrator')) {
       const groupChatId = String(memberChat.id);
-      PropertiesService.getScriptProperties().setProperty('TELEGRAM_CHAT_ID', groupChatId);
-      logEvent_('GROUP_JOIN', 'הבוט צורף לקבוצה "' + (memberChat.title || groupChatId) + '" והוגדר לשלוח אליה התראות.');
+      setProp_('TELEGRAM_CHAT_ID', groupChatId);
       sendInteractiveMainMenu_(
         groupChatId,
         '🎉 *הבוט חובר בהצלחה לקבוצה "' + escapeMarkdown_(memberChat.title || 'שלכם') + '"!*\n' +
-        'מעתה כל הדירות החדשות יישלחו לכאן, וניתן לשלוט בהכל ישירות דרך הכפתורים למטה:'
+        'מעתה כל הדירות החדשות יישלחו לכאן, וניתן לשלוט בהכל ישירות דרך הכפתורים למטה:',
+        null,
+        true
       );
+      logEvent_('GROUP_JOIN', 'הבוט צורף לקבוצה "' + (memberChat.title || groupChatId) + '" והוגדר לשלוח אליה התראות.');
       return;
     }
   }
@@ -1958,47 +2192,46 @@ function handleTelegramUpdateObject_(update) {
   const isGroupChat = (chatType === 'group' || chatType === 'supergroup');
 
   if (isGroupChat && Array.isArray(msg.new_chat_members) && msg.new_chat_members.length > 0) {
-    PropertiesService.getScriptProperties().setProperty('TELEGRAM_CHAT_ID', chatId);
+    setProp_('TELEGRAM_CHAT_ID', chatId);
   }
 
   const savedChatId = getChatId_();
   if (!savedChatId || (isGroupChat && String(savedChatId).indexOf('-') !== 0)) {
-    PropertiesService.getScriptProperties().setProperty('TELEGRAM_CHAT_ID', chatId);
+    setProp_('TELEGRAM_CHAT_ID', chatId);
   }
 
   if (!msg.text) return;
   const rawText = String(msg.text).trim();
-  const props = PropertiesService.getScriptProperties();
-  const awaitingInput = props.getProperty('AWAITING_INPUT_' + chatId) || '';
+  const awaitingInput = getProp_('AWAITING_INPUT_' + chatId) || '';
 
   // 3. טיפול בלחיצה על כפתורי המקלדת התחתונה הקבועה (Reply Keyboard)
   if (rawText === REPLY_BTN.MENU || rawText === 'תפריט' || rawText === 'כפתורים') {
-    props.deleteProperty('AWAITING_INPUT_' + chatId);
-    sendInteractiveMainMenu_(chatId);
+    deleteProp_('AWAITING_INPUT_' + chatId);
+    sendInteractiveMainMenu_(chatId, null, null, true);
     return;
   }
   if (rawText === REPLY_BTN.SCAN) {
-    props.deleteProperty('AWAITING_INPUT_' + chatId);
+    deleteProp_('AWAITING_INPUT_' + chatId);
     triggerScanAndReply_(chatId);
     return;
   }
   if (rawText === REPLY_BTN.SEARCHES) {
-    props.deleteProperty('AWAITING_INPUT_' + chatId);
+    deleteProp_('AWAITING_INPUT_' + chatId);
     sendSearchesManagementMenu_(chatId);
     return;
   }
   if (rawText === REPLY_BTN.BBOX) {
-    props.deleteProperty('AWAITING_INPUT_' + chatId);
+    deleteProp_('AWAITING_INPUT_' + chatId);
     sendBBoxMenu_(chatId);
     return;
   }
   if (rawText === REPLY_BTN.PRICE) {
-    props.deleteProperty('AWAITING_INPUT_' + chatId);
+    deleteProp_('AWAITING_INPUT_' + chatId);
     sendPriceMenu_(chatId);
     return;
   }
   if (rawText === REPLY_BTN.STATUS) {
-    props.deleteProperty('AWAITING_INPUT_' + chatId);
+    deleteProp_('AWAITING_INPUT_' + chatId);
     sendStatusMessageWithButtons_(chatId);
     return;
   }
@@ -2006,7 +2239,7 @@ function handleTelegramUpdateObject_(update) {
   // 4. אם המשתמש הדביק קישור של יד 2 בצ'אט/קבוצה
   const yad2UrlMatch = rawText.match(/https?:\/\/(?:www\.)?yad2\.co\.il\/realestate\/[^\s]+/i);
   if (yad2UrlMatch && rawText.indexOf('/remove') !== 0) {
-    props.deleteProperty('AWAITING_INPUT_' + chatId);
+    deleteProp_('AWAITING_INPUT_' + chatId);
     let newUrl = yad2UrlMatch[0];
     const isBBoxLink = newUrl.indexOf('bBox=') !== -1;
     if (isBBoxLink) {
@@ -2022,19 +2255,19 @@ function handleTelegramUpdateObject_(update) {
 
   // 5. אם הבוט ממתין לקלט לאחר לחיצה על כפתור "הקלדת מחיר מותאם אישית" או "הזנת קואורדינטות bBox"
   if (awaitingInput === 'PRICE' && rawText.indexOf('/') !== 0) {
-    props.deleteProperty('AWAITING_INPUT_' + chatId);
+    deleteProp_('AWAITING_INPUT_' + chatId);
     handlePriceCommandFromTelegram_(chatId, '/price ' + rawText);
     return;
   }
   if (awaitingInput === 'ROOMS' && rawText.indexOf('/') !== 0) {
-    props.deleteProperty('AWAITING_INPUT_' + chatId);
+    deleteProp_('AWAITING_INPUT_' + chatId);
     handleRoomsCommandFromTelegram_(chatId, rawText);
     return;
   }
   if (awaitingInput === 'BBOX' && rawText.indexOf('/') !== 0) {
     const coords = parseBBoxCoordsFromTextOrUrl_(rawText);
     if (coords) {
-      props.deleteProperty('AWAITING_INPUT_' + chatId);
+      deleteProp_('AWAITING_INPUT_' + chatId);
       const globalLimits = getGlobalPriceLimits_();
       const cleanUrl = buildCleanBBoxYad2Url_(coords, globalLimits.maxPrice);
       addSearchUrlFromTelegram_(chatId, cleanUrl, 'חיפוש מפה מותאם אישית (bBox נקי ללא עיר/אזור)', true);
@@ -2045,12 +2278,12 @@ function handleTelegramUpdateObject_(update) {
   // 6. תמיכה גם בפקודות רגילות (כולל בקבוצה עם @BotName או עם תווים נסתרים)
   const cmdMatch = rawText.match(/^\/([a-zA-Z0-9_]+)(?:@\S+)?\s*([\s\S]*)$/);
   if (cmdMatch) {
-    props.deleteProperty('AWAITING_INPUT_' + chatId);
+    deleteProp_('AWAITING_INPUT_' + chatId);
     const cmd = cmdMatch[1].toLowerCase();
     const arg = (cmdMatch[2] || '').trim();
 
     if (cmd === 'start' || cmd === 'help' || cmd === 'menu') {
-      sendInteractiveMainMenu_(chatId);
+      sendInteractiveMainMenu_(chatId, null, null, true);
       return;
     }
     if (cmd === 'list' || cmd === 'searches' || cmd === 'merge') {
@@ -2091,17 +2324,18 @@ function handleTelegramUpdateObject_(update) {
       return;
     }
     if (cmd === 'setgroup') {
-      PropertiesService.getScriptProperties().setProperty('TELEGRAM_CHAT_ID', chatId);
+      setProp_('TELEGRAM_CHAT_ID', chatId);
       sendInteractiveMainMenu_(chatId, '✅ *הקבוצה הנוכחית הוגדרה כיעד ההתראות הקבוע של הבוט!*');
       return;
     }
     if (cmd === 'remove' && arg) {
       const idx = parseInt(arg, 10);
       const ss = getSpreadsheet_();
-      const searches = getActiveSearchUrls_(ss);
+      const searches = getCachedActiveSearches_(ss);
       if (!isNaN(idx) && idx >= 1 && idx <= searches.length) {
         const target = searches[idx - 1];
         ss.getSheetByName(CONFIG.SHEETS.SEARCHES).getRange(target.rowIndex, 1).setValue('לא');
+        invalidateSearchesCache_();
         sendTelegramText_(chatId, '🗑️ החיפוש *' + escapeMarkdown_(target.name) + '* הושבת בהצלחה.');
       }
       sendSearchesManagementMenu_(chatId);
@@ -2110,10 +2344,12 @@ function handleTelegramUpdateObject_(update) {
     if (cmd === 'github') {
       const parts = arg.split(/\s+/);
       if (parts.length >= 2) {
-        props.setProperty('GITHUB_REPO', parts[0].trim());
-        props.setProperty('GITHUB_TOKEN', parts[1].trim());
+        setPropsBatch_({
+          GITHUB_REPO: parts[0].trim(),
+          GITHUB_TOKEN: parts[1].trim()
+        });
         sendTelegramText_(chatId, '✅ חיבור GitHub Actions (`' + parts[0].trim() + '`) נשמר! מפעיל כעת סריקת בדיקה...');
-        triggerGitHubActionsWorkflow_();
+        triggerGitHubActionsWorkflow_(true);
       } else {
         sendTelegramText_(chatId, 'ℹ️ שלח `/github owner/repo ghp_your_token` כדי לחבר הפעלה ישירה של GitHub Actions.');
       }
@@ -2133,11 +2369,11 @@ function handleTelegramCallbackQuery_(cb) {
   if (!msg || !msg.chat) return;
 
   const chatId = String(msg.chat.id);
-  const props = PropertiesService.getScriptProperties();
+  const messageId = msg.message_id || null;
 
   // שמירה אוטומטית של מזהה הקבוצה ברגע שלוחצים בה על כפתור
   if (msg.chat.type === 'group' || msg.chat.type === 'supergroup') {
-    props.setProperty('TELEGRAM_CHAT_ID', chatId);
+    setProp_('TELEGRAM_CHAT_ID', chatId);
   }
 
   // מענה מהיר לטלגרם כדי להעלים את אנימציית הטעינה על הכפתור
@@ -2150,30 +2386,30 @@ function handleTelegramCallbackQuery_(cb) {
     });
   } catch (e) {}
 
-  // ניווט בין תפריטים
+  // ניווט בין תפריטים (עריכת ההודעה הקיימת במקום שליחת הודעה חדשה - מהיר ונקי!)
   if (data === 'MENU_MAIN') {
-    props.deleteProperty('AWAITING_INPUT_' + chatId);
-    sendInteractiveMainMenu_(chatId);
+    deleteProp_('AWAITING_INPUT_' + chatId);
+    sendInteractiveMainMenu_(chatId, null, messageId);
     return;
   }
   if (data === 'MENU_SEARCHES') {
-    sendSearchesManagementMenu_(chatId);
+    sendSearchesManagementMenu_(chatId, messageId);
     return;
   }
   if (data === 'MENU_BBOX') {
-    sendBBoxMenu_(chatId);
+    sendBBoxMenu_(chatId, messageId);
     return;
   }
   if (data === 'MENU_PRESETS') {
-    sendPresetAreasMenu_(chatId);
+    sendPresetAreasMenu_(chatId, messageId);
     return;
   }
   if (data === 'MENU_PRICE') {
-    sendPriceMenu_(chatId);
+    sendPriceMenu_(chatId, messageId);
     return;
   }
   if (data === 'MENU_ROOMS') {
-    sendRoomsMenu_(chatId);
+    sendRoomsMenu_(chatId, messageId);
     return;
   }
   if (data.indexOf('SET_ROOMS_') === 0) {
@@ -2183,16 +2419,16 @@ function handleTelegramCallbackQuery_(cb) {
     setGlobalRoomsLimits_(mn, mx);
     sendInteractiveMainMenu_(chatId, (mn || mx)
       ? '✅ *טווח החדרים עודכן: ' + escapeMarkdown_(formatRoomsFilterSummary_({ minRooms: mn, maxRooms: mx })) + ' (חל על כל החיפושים)!*'
-      : '✅ *סינון החדרים בוטל!*');
+      : '✅ *סינון החדרים בוטל!*', messageId);
     return;
   }
   if (data === 'ROOMS_CUSTOM_PROMPT') {
-    props.setProperty('AWAITING_INPUT_' + chatId, 'ROOMS');
+    setProp_('AWAITING_INPUT_' + chatId, 'ROOMS');
     sendTelegramText_(chatId, '✍️ כתבו עכשיו טווח חדרים, למשל `2.5-3.5` (או מספר בודד, או `0` לביטול):');
     return;
   }
   if (data === 'MENU_STATUS') {
-    sendStatusMessageWithButtons_(chatId);
+    sendStatusMessageWithButtons_(chatId, messageId);
     return;
   }
 
@@ -2204,8 +2440,8 @@ function handleTelegramCallbackQuery_(cb) {
 
   // קיבוע הקבוצה כיעד התראות
   if (data === 'ACT_SETGROUP') {
-    props.setProperty('TELEGRAM_CHAT_ID', chatId);
-    sendInteractiveMainMenu_(chatId, '✅ *הצ\'אט הנוכחי (`' + chatId + '`) הוגדר כיעד ההתראות הקבוע!*');
+    setProp_('TELEGRAM_CHAT_ID', chatId);
+    sendInteractiveMainMenu_(chatId, '✅ *הצ\'אט הנוכחי (`' + chatId + '`) הוגדר כיעד ההתראות הקבוע!*', messageId);
     return;
   }
 
@@ -2216,12 +2452,12 @@ function handleTelegramCallbackQuery_(cb) {
     const note = priceVal > 0
       ? '✅ *תקרת המחיר עודכנה לעד ₪' + priceVal.toLocaleString('en-US') + '!*'
       : '✅ *מגבלת המחיר הגלובלית בוטלה!*';
-    sendInteractiveMainMenu_(chatId, note);
+    sendInteractiveMainMenu_(chatId, note, messageId);
     return;
   }
 
   if (data === 'PRICE_CUSTOM_PROMPT') {
-    props.setProperty('AWAITING_INPUT_' + chatId, 'PRICE');
+    setProp_('AWAITING_INPUT_' + chatId, 'PRICE');
     sendTelegramText_(
       chatId,
       '✍️ *הקלדת מחיר מותאם אישית:*\n' +
@@ -2255,9 +2491,10 @@ function handleTelegramCallbackQuery_(cb) {
     if (sheet && !isNaN(rowIdx) && rowIdx >= 2 && rowIdx <= sheet.getLastRow()) {
       const removedName = String(sheet.getRange(rowIdx, 2).getValue() || 'חיפוש');
       sheet.getRange(rowIdx, 1).setValue('לא');
+      invalidateSearchesCache_();
       sendTelegramText_(chatId, '🗑️ החיפוש *' + escapeMarkdown_(removedName) + '* הוסר.');
     }
-    sendSearchesManagementMenu_(chatId);
+    sendSearchesManagementMenu_(chatId, messageId);
     return;
   }
 
@@ -2270,9 +2507,10 @@ function handleTelegramCallbackQuery_(cb) {
       const oldUrl = String(sheet.getRange(rowIdx, 3).getValue() || '');
       const cleanUrl = sanitizeBBoxUrl_(oldUrl);
       sheet.getRange(rowIdx, 3).setValue(cleanUrl);
+      invalidateSearchesCache_();
       sendTelegramText_(chatId, '🧹 הקישור נוקה מפרמטרים של עיר/אזור וכעת סורק לפי ה-bBox בלבד!\n' + cleanUrl);
     }
-    sendSearchesManagementMenu_(chatId);
+    sendSearchesManagementMenu_(chatId, messageId);
     return;
   }
 
@@ -2290,8 +2528,9 @@ function handleTelegramCallbackQuery_(cb) {
         cleanedCount++;
       }
     }
+    invalidateSearchesCache_();
     sendTelegramText_(chatId, '✅ נוקו *' + cleanedCount + '* חיפושי מפה (`bBox`) מכל הגבלה של עיר או אזור!');
-    sendSearchesManagementMenu_(chatId);
+    sendSearchesManagementMenu_(chatId, messageId);
     return;
   }
 
@@ -2327,7 +2566,7 @@ function handleTelegramCallbackQuery_(cb) {
   }
 
   if (data === 'BBOX_CUSTOM_PROMPT') {
-    props.setProperty('AWAITING_INPUT_' + chatId, 'BBOX');
+    setProp_('AWAITING_INPUT_' + chatId, 'BBOX');
     sendTelegramText_(
       chatId,
       '🗺 *הוספת חיפוש מפה (bBox) נקי:*\n' +
@@ -2368,7 +2607,7 @@ function handleTelegramCallbackQuery_(cb) {
 }
 
 function triggerScanAndReply_(chatId) {
-  const ghRes = triggerGitHubActionsWorkflow_();
+  const ghRes = triggerGitHubActionsWorkflow_(true);
   if (ghRes.triggered) {
     sendTelegramText_(chatId, '🚀 *סריקת ענן ב-GitHub Actions הופעלה בהצלחה!*\nדירות חדשות יישלחו לכאן תוך כדקה.');
   } else {
@@ -2391,7 +2630,6 @@ function handlePriceCommandFromTelegram_(chatId, commandText) {
 
   if (arg === 'off' || arg === '0' || arg === 'clear' || arg === 'ללא' || arg === 'בטל') {
     setGlobalPriceLimits_(0, 0);
-    logEvent_('PRICE_LIMIT', 'מגבלת המחיר הגלובלית בוטלה מהטלגרם.');
     sendInteractiveMainMenu_(chatId, '✅ *מגבלת המחיר הגלובלית בוטלה בהצלחה!*');
     return;
   }
@@ -2402,7 +2640,6 @@ function handlePriceCommandFromTelegram_(chatId, commandText) {
     const maxVal = parseInt(rangeMatch[2].replace(/,/g, ''), 10);
     if (!isNaN(minVal) && !isNaN(maxVal) && maxVal >= minVal) {
       setGlobalPriceLimits_(minVal, maxVal);
-      logEvent_('PRICE_LIMIT', 'עודכן טווח מחיר גלובלי: ' + minVal + '-' + maxVal);
       sendInteractiveMainMenu_(
         chatId,
         '✅ *טווח המחירים עודכן בהצלחה: ₪' + minVal.toLocaleString('en-US') + ' – ₪' + maxVal.toLocaleString('en-US') + '!*'
@@ -2414,7 +2651,6 @@ function handlePriceCommandFromTelegram_(chatId, commandText) {
   const singleVal = parseInt(arg.replace(/[^\d]/g, ''), 10);
   if (!isNaN(singleVal) && singleVal > 0) {
     setGlobalPriceLimits_(0, singleVal);
-    logEvent_('PRICE_LIMIT', 'עודכן מחיר מקסימלי גלובלי: עד ' + singleVal);
     sendInteractiveMainMenu_(
       chatId,
       '✅ *תקרת המחיר עודכנה בהצלחה: עד ₪' + singleVal.toLocaleString('en-US') + '!*'
@@ -2427,14 +2663,18 @@ function handlePriceCommandFromTelegram_(chatId, commandText) {
 
 function addSearchUrlFromTelegram_(chatId, newUrl, customName, wasCleanedBBox) {
   const ss = getSpreadsheet_();
-  initSheets_(ss);
-  const sheet = ss.getSheetByName(CONFIG.SHEETS.SEARCHES);
+  let sheet = ss.getSheetByName(CONFIG.SHEETS.SEARCHES);
+  if (!sheet) {
+    initSheets_(ss);
+    sheet = ss.getSheetByName(CONFIG.SHEETS.SEARCHES);
+  }
 
   const cleanUrl = newUrl.indexOf('bBox=') !== -1 ? sanitizeBBoxUrl_(newUrl) : newUrl;
   const urlLimits = extractPriceLimitsFromYad2Url_(cleanUrl);
   const maxPriceColVal = urlLimits.maxPrice > 0 ? urlLimits.maxPrice : '';
 
   sheet.appendRow(['כן', customName, cleanUrl, '', 'נוסף מהטלגרם', '', '', maxPriceColVal]);
+  invalidateSearchesCache_();
 
   let notes = '';
   if (wasCleanedBBox || cleanUrl.indexOf('bBox=') !== -1) {
@@ -2570,6 +2810,39 @@ function sendTelegramNotificationItem_(token, chatId, caption, imageUrl, itemUrl
   return sendTelegramText_(chatId, caption, inlineKeyboard);
 }
 
+function editOrSendTelegramText_(chatId, messageId, text, replyMarkup) {
+  if (messageId) {
+    const token = getBotToken_();
+    if (token && chatId) {
+      const payload = {
+        chat_id: chatId,
+        message_id: messageId,
+        text: text,
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true
+      };
+      if (replyMarkup) {
+        payload.reply_markup = replyMarkup;
+      }
+      try {
+        const res = UrlFetchApp.fetch('https://api.telegram.org/bot' + token + '/editMessageText', {
+          method: 'post',
+          contentType: 'application/json',
+          payload: JSON.stringify(payload),
+          muteHttpExceptions: true
+        });
+        const code = res.getResponseCode();
+        if (code === 200) return true;
+        const bodyText = res.getContentText() || '';
+        if (code === 400 && bodyText.indexOf('message is not modified') !== -1) {
+          return true;
+        }
+      } catch (e) {}
+    }
+  }
+  return sendTelegramText_(chatId, text, replyMarkup);
+}
+
 function sendTelegramText_(chatId, text, replyMarkup) {
   const token = getBotToken_();
   if (!token || !chatId) return false;
@@ -2602,7 +2875,7 @@ function sendTelegramText_(chatId, text, replyMarkup) {
       const migratedChatId = errObj && errObj.parameters && errObj.parameters.migrate_to_chat_id;
       if (migratedChatId) {
         const newChatIdStr = String(migratedChatId);
-        PropertiesService.getScriptProperties().setProperty('TELEGRAM_CHAT_ID', newChatIdStr);
+        setProp_('TELEGRAM_CHAT_ID', newChatIdStr);
         payload.chat_id = newChatIdStr;
         const retryRes = UrlFetchApp.fetch('https://api.telegram.org/bot' + token + '/sendMessage', {
           method: 'post',
@@ -2639,7 +2912,7 @@ function sendTelegramText_(chatId, text, replyMarkup) {
 // ============================================================================
 
 function getBotToken_() {
-  const propToken = PropertiesService.getScriptProperties().getProperty('TELEGRAM_BOT_TOKEN');
+  const propToken = getProp_('TELEGRAM_BOT_TOKEN');
   if (propToken && propToken.trim() !== '') return propToken.trim();
   return String(CONFIG.TELEGRAM_BOT_TOKEN || '').trim();
 }
@@ -2648,7 +2921,7 @@ function getChatId_() {
   const configChat = String(CONFIG.TELEGRAM_CHAT_ID || '').trim();
   if (configChat !== '') return configChat;
 
-  const propChat = PropertiesService.getScriptProperties().getProperty('TELEGRAM_CHAT_ID');
+  const propChat = getProp_('TELEGRAM_CHAT_ID');
   if (propChat && propChat.trim() !== '') return propChat.trim();
   return '';
 }
@@ -2733,6 +3006,10 @@ function formatIsraelTime_(dateObj) {
 function logEvent_(type, details) {
   console.log('[' + type + '] ' + details);
   try {
+    // מונע פתיחה איטית של גיליון Google Sheets אם הוא לא פתוח כבר בזיכרון עבור אירועים שגרתיים
+    if (!_cachedSs && type !== 'GITHUB_INGEST_OK' && type !== 'CRITICAL' && type !== 'SETUP' && type.indexOf('ERR') === -1) {
+      return;
+    }
     const ss = getSpreadsheet_();
     const logSheet = ss.getSheetByName(CONFIG.SHEETS.LOGS);
     if (logSheet) {

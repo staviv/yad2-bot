@@ -28,9 +28,11 @@ jobs:
         with:
           path: |
             ~/.cloakbrowser
+            ~/.npm
             ./yad2-profile
-          key: cloakbrowser-yad2-v2-${{ runner.os }}
+          key: cloakbrowser-yad2-v3-${{ runner.os }}
           restore-keys: |
+            cloakbrowser-yad2-v3-
             cloakbrowser-yad2-v2-
             cloakbrowser-yad2-v1-
 
@@ -44,8 +46,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends xvfb xauth libgbm1 libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libpango-1.0-0 libcairo2 libasound2t64 fonts-noto-core || sudo apt-get install -y xvfb
 
           npm init -y
-          npm install cloakbrowser playwright-core
-          npx playwright-core install-deps chromium || true
+          npm install --prefer-offline --no-audit --no-fund cloakbrowser playwright-core
 
           # אם בינארי הדפדפן כבר קיים מה-Cache, אין צורך להוריד 535MB מחדש (מונע חסימת Rate Limit של GitHub Releases)
           if [ -d "$HOME/.cloakbrowser" ] && [ -n "$(find "$HOME/.cloakbrowser" -type f -executable 2>/dev/null)" ]; then
@@ -76,14 +77,7 @@ jobs:
             for (let attempt = 1; attempt <= 2; attempt++) {
               await page.goto(searchItem.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
 
-              // Simulate human mouse movement and scroll so behavioral anti-bot checks pass
-              try {
-                await page.mouse.move(300 + Math.floor(Math.random() * 400), 250 + Math.floor(Math.random() * 300));
-                await page.waitForTimeout(1500);
-                await page.mouse.wheel(0, 300);
-              } catch (e) {}
-
-              // Poll up to 25 seconds for __NEXT_DATA__ or feed links (allows ShieldSquare JS redirect to finish)
+              // Poll up to 25 seconds for __NEXT_DATA__ or feed links (checks immediately first before sleeping)
               for (let sec = 0; sec < 25; sec++) {
                 const state = await page.evaluate(() => {
                   const el = document.getElementById('__NEXT_DATA__');
@@ -114,6 +108,13 @@ jobs:
                     maxPrice: searchItem.maxPrice || null,
                     html: state.content
                   };
+                }
+
+                if (sec === 0) {
+                  try {
+                    await page.mouse.move(300 + Math.floor(Math.random() * 400), 250 + Math.floor(Math.random() * 300));
+                    await page.mouse.wheel(0, 300);
+                  } catch (e) {}
                 }
                 await page.waitForTimeout(1000);
               }
@@ -184,11 +185,11 @@ jobs:
             const page = await context.newPage();
             const pagesPayload = [];
 
-            // Warm-up on a low-sensitivity page first
+            // Quick warm-up on homepage
             try {
               console.log('Warm-up visit to yad2.co.il...');
-              await page.goto('https://www.yad2.co.il/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-              await page.waitForTimeout(3000);
+              await page.goto('https://www.yad2.co.il/', { waitUntil: 'domcontentloaded', timeout: 20000 });
+              await page.waitForTimeout(800);
             } catch (e) {
               console.warn('Warm-up note:', e.message);
             }
