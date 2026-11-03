@@ -199,6 +199,15 @@ function ensureExtendedSearchAreas_(ss) {
     let rawUrl = String(rangeValues[i][2] || '').trim();
     if (!rawUrl) continue;
 
+    // אם קיים קישור של דירות למכירה (/forsale או /for-sale), נמיר אותו אוטומטית להשכרה (/rent)
+    if (isForSaleYad2Url_(rawUrl)) {
+      const rentUrl = normalizeToRentUrl_(rawUrl);
+      if (rentUrl !== rawUrl) {
+        sheet.getRange(i + 2, 3).setValue(rentUrl);
+        rawUrl = rentUrl;
+      }
+    }
+
     // אם קיים קישור עם bBox שיש בו area= או city=, ננקה אותו אוטומטית כדי שיעבוד כ-bBox טהור!
     if (rawUrl.indexOf('bBox=') !== -1 && (rawUrl.indexOf('area=') !== -1 || rawUrl.indexOf('city=') !== -1)) {
       const cleanedBBoxUrl = sanitizeBBoxUrl_(rawUrl);
@@ -398,8 +407,113 @@ function deleteTelegramWebhook() {
 }
 
 // ============================================================================
-// 🗺️ ניקוי ואיחוד חיפושים + חיפוש bBox נקי (ללא עיר ואזור!)
+// 🗺️ ניקוי ואיחוד חיפושים + חיפוש bBox נקי + המרה אוטומטית של קישורי מכירה להשכרה
 // ============================================================================
+
+/**
+ * בודק האם קישור יד 2 מצביע על דירות למכירה (/realestate/forsale או /realestate/for-sale)
+ */
+function isForSaleYad2Url_(rawUrl) {
+  return /\/realestate\/(?:forsale|for-sale)(?=\/|\?|$)/i.test(String(rawUrl || ''));
+}
+
+/**
+ * ממיר אוטומטית כל קישור של דירות למכירה (/realestate/forsale או /for-sale) לקישור דירות להשכרה (/realestate/rent)
+ */
+function normalizeToRentUrl_(rawUrl) {
+  let url = String(rawUrl || '').trim();
+  if (!url) return url;
+  return url.replace(/\/realestate\/(?:forsale|for-sale)(?=\/|\?|$)/i, '/realestate/rent');
+}
+
+/**
+ * מנקה מהגיליון דירות שנכנסו בטעות מחיפוש דירות למכירה (למשל דירות ללא מחיר מאזור 12 שנכנסו לפני תיקון הקישור)
+ * ומתקן בגיליון קישורי חיפוש כל קישור /forsale לקישור /rent
+ */
+function cleanupForSaleAndFixSheet_(ssOptional) {
+  const ss = ssOptional || getSpreadsheet_();
+  const searchesSheet = ss.getSheetByName(CONFIG.SHEETS.SEARCHES);
+  const aptSheet = ss.getSheetByName(CONFIG.SHEETS.APARTMENTS);
+
+  const fixedSearches = [];
+  const forSaleSearchNames = {};
+
+  if (searchesSheet && searchesSheet.getLastRow() >= 2) {
+    const lastSearchRow = searchesSheet.getLastRow();
+    const searchVals = searchesSheet.getRange(2, 1, lastSearchRow - 1, 5).getValues();
+    for (let i = 0; i < searchVals.length; i++) {
+      const rowNum = i + 2;
+      const oldName = String(searchVals[i][1] || '').trim();
+      const oldUrl = String(searchVals[i][2] || '').trim();
+      if (isForSaleYad2Url_(oldUrl)) {
+        const newUrl = normalizeToRentUrl_(oldUrl);
+        let newName = oldName;
+        if (oldName === 'חיפוש אזור 12' || oldUrl.indexOf('area=12') !== -1) {
+          newName = 'אזור רחובות, מזכרת בתיה ונס ציונה (אזור 12)';
+        }
+        searchesSheet.getRange(rowNum, 2).setValue(newName);
+        searchesSheet.getRange(rowNum, 3).setValue(newUrl);
+        searchesSheet.getRange(rowNum, 5).setValue('תוקן אוטומטית ממכירה להשכרה');
+        if (oldName) forSaleSearchNames[oldName] = true;
+        fixedSearches.push({ row: rowNum, oldName: oldName, newName: newName, oldUrl: oldUrl, newUrl: newUrl });
+      }
+    }
+  }
+
+  // גם אם השם היה "חיפוש אזור 12" (שנוצר מהקישור forsale?area=12) נסמן אותו לניקוי הדירות ללא מחיר שנכנסו ממנו
+  forSaleSearchNames['חיפוש אזור 12'] = true;
+
+  const removedApartments = [];
+  if (aptSheet && aptSheet.getLastRow() >= 2) {
+    const lastAptRow = aptSheet.getLastRow();
+    const aptVals = aptSheet.getRange(2, 1, lastAptRow - 1, 14).getValues();
+    // עוברים מהסוף להתחלה כדי שמחיקת שורה לא תזיז את האינדקסים של השורות שלפניה
+    for (let r = aptVals.length - 1; r >= 0; r--) {
+      const sheetRow = r + 2;
+      const token = String(aptVals[r][1] || '').trim();
+      const priceText = String(aptVals[r][2] || '').trim();
+      const addressText = String(aptVals[r][7] || '').trim();
+      const matchedSearch = String(aptVals[r][10] || '').trim();
+      const itemUrl = String(aptVals[r][11] || '').trim();
+
+      const numPrice = parseNumericPrice_(priceText);
+      const isUnpricedOrSalePrice = (numPrice === null || numPrice > 25000);
+      const isFromForSaleSearch = Boolean(
+        forSaleSearchNames[matchedSearch] ||
+        matchedSearch.indexOf('חיפוש אזור 12') !== -1 ||
+        isForSaleYad2Url_(itemUrl)
+      );
+
+      if (isFromForSaleSearch && isUnpricedOrSalePrice) {
+        aptSheet.deleteRow(sheetRow);
+        removedApartments.push({
+          row: sheetRow,
+          token: token,
+          price: priceText,
+          address: addressText,
+          matchedSearch: matchedSearch
+        });
+      }
+    }
+
+    const remainingRows = Math.max(0, aptSheet.getLastRow() - 1);
+    setProp_('CACHED_APARTMENTS_COUNT', String(remainingRows));
+  }
+
+  invalidateSearchesCache_();
+  logEvent_(
+    'CLEANUP_FORSALE',
+    'תוקנו ' + fixedSearches.length + ' קישורי מכירה להשכרה | נמחקו ' + removedApartments.length + ' דירות מכירה מהמאגר.'
+  );
+
+  return {
+    ok: true,
+    fixedSearchesCount: fixedSearches.length,
+    fixedSearches: fixedSearches,
+    removedApartmentsCount: removedApartments.length,
+    removedApartments: removedApartments
+  };
+}
 
 /**
  * מוודא שכל קישור שמכיל bBox= יהיה נקי לחלוטין מפרמטרים מגבילים של area=, city=, neighborhood=, topArea=
@@ -585,12 +699,16 @@ function mergeActiveSearchesInSheet_(ss, mode) {
     if (list.length > 1) {
       // נשאיר שורה אחת שתהיה כל האזור (ללא city=)
       const keepEntry = list[0].search;
-      const cleanAreaUrl = 'https://www.yad2.co.il/realestate/rent/south?area=' + areaCodes[a];
+      const cleanAreaUrl = areaCodes[a] === '12'
+        ? 'https://www.yad2.co.il/realestate/rent/center-and-sharon?area=12'
+        : 'https://www.yad2.co.il/realestate/rent/south?area=' + areaCodes[a];
       sheet.getRange(keepEntry.rowIndex, 3).setValue(cleanAreaUrl);
       if (areaCodes[a] === '99') {
         sheet.getRange(keepEntry.rowIndex, 2).setValue('אזור השפלה - קריית מלאכי, חצב, באר טוביה והמושבים (אזור 99)');
       } else if (areaCodes[a] === '52') {
         sheet.getRange(keepEntry.rowIndex, 2).setValue('אזור גדרה - יבנה והסביבה (אזור 52)');
+      } else if (areaCodes[a] === '12') {
+        sheet.getRange(keepEntry.rowIndex, 2).setValue('אזור רחובות, מזכרת בתיה ונס ציונה (אזור 12)');
       }
       for (let k = 1; k < list.length; k++) {
         sheet.getRange(list[k].search.rowIndex, 1).setValue('לא');
@@ -792,6 +910,12 @@ function doGet(e) {
       }, null, 2)).setMimeType(ContentService.MimeType.JSON);
     }
 
+    if (action === 'cleanup_forsale') {
+      const cleanupRes = cleanupForSaleAndFixSheet_();
+      return ContentService.createTextOutput(JSON.stringify(cleanupRes, null, 2))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
     if (action === 'searches') {
       const searches = getCachedActiveSearches_();
       const globalLimits = getGlobalPriceLimits_();
@@ -867,6 +991,13 @@ function processIngestedYad2Payload_(payload) {
     for (let i = 0; i < pages.length; i++) {
       const pageEntry = pages[i];
       const sourceUrl = pageEntry.url || 'https://www.yad2.co.il/realestate/rent';
+
+      // הגנה כפולה: אם מסיבה כלשהי נסרק עמוד של דירות למכירה (/forsale), נדלג עליו לחלוטין!
+      if (isForSaleYad2Url_(sourceUrl)) {
+        logEvent_('SKIP_FORSALE', 'דולג עמוד דירות למכירה שנשלח לסריקה: ' + sourceUrl);
+        continue;
+      }
+
       const matchingSearch = findSearchRowByUrl_(activeSearches, sourceUrl);
       const searchName = pageEntry.name || (matchingSearch ? matchingSearch.name : findSearchNameByUrl_(activeSearches, sourceUrl));
 
@@ -1471,6 +1602,12 @@ function normalizeYad2ListingItem_(raw, sourceUrl) {
 
   if (!token) return null;
 
+  // חסימת מודעות למכירה אם זוהו בשדות ה-JSON הפנימיים של יד 2
+  const dealType = String(raw.orderType || raw.dealType || (raw.metaData && raw.metaData.orderType) || '').toLowerCase();
+  if (dealType === 'forsale' || dealType === 'for-sale') {
+    return null;
+  }
+
   const addr = raw.address || {};
   const details = raw.additionalDetails || {};
   const meta = raw.metaData || {};
@@ -1828,6 +1965,14 @@ function getActiveSearchUrls_(ss) {
 
     const isActive = (isActiveRaw === 'כן' || isActiveRaw === 'true' || isActiveRaw === '1' || isActiveRaw === 'yes' || isActiveRaw === 'v');
     if (isActive && rawUrl.indexOf('yad2.co.il') !== -1) {
+      // אם החיפוש בגיליון מכיל קישור מכירה (/forsale), נמיר אותו אוטומטית להשכרה (/rent) ונתקן בגיליון!
+      if (isForSaleYad2Url_(rawUrl)) {
+        rawUrl = normalizeToRentUrl_(rawUrl);
+        try {
+          sheet.getRange(i + 2, 3).setValue(rawUrl);
+        } catch (e) {}
+      }
+
       // אם החיפוש הוא חיפוש bBox, ננקה ממנו אוטומטית כל זכר ל-area= או city=
       if (rawUrl.indexOf('bBox=') !== -1) {
         rawUrl = sanitizeBBoxUrl_(rawUrl);
@@ -2111,6 +2256,9 @@ function sendPresetAreasMenu_(chatId, messageId) {
   const inlineKeyboard = {
     inline_keyboard: [
       [
+        { text: '📍 אזור רחובות, מזכרת בתיה ונס ציונה (area=12)', callback_data: 'ADD_PRESET_AREA12' }
+      ],
+      [
         { text: '📍 אזור השפלה המלא (area=99: קריית מלאכי, חצב והמושבים)', callback_data: 'ADD_PRESET_AREA99' }
       ],
       [
@@ -2341,6 +2489,10 @@ function handleTelegramUpdateObject_(update) {
   if (yad2UrlMatch && rawText.indexOf('/remove') !== 0) {
     deleteProp_('AWAITING_INPUT_' + chatId);
     let newUrl = yad2UrlMatch[0];
+    const wasForSale = isForSaleYad2Url_(newUrl);
+    if (wasForSale) {
+      newUrl = normalizeToRentUrl_(newUrl);
+    }
     const isBBoxLink = newUrl.indexOf('bBox=') !== -1;
     if (isBBoxLink) {
       newUrl = sanitizeBBoxUrl_(newUrl);
@@ -2349,7 +2501,7 @@ function handleTelegramUpdateObject_(update) {
       .replace(yad2UrlMatch[0], '')
       .replace(/^\/add(@\S+)?\s*/i, '')
       .trim() || buildSearchNameFromUrl_(newUrl);
-    addSearchUrlFromTelegram_(chatId, newUrl, customName, isBBoxLink);
+    addSearchUrlFromTelegram_(chatId, newUrl, customName, isBBoxLink, wasForSale);
     return;
   }
 
@@ -2677,6 +2829,15 @@ function handleTelegramCallbackQuery_(cb) {
   }
 
   // כפתורי הוספת אזורים מוכנים
+  if (data === 'ADD_PRESET_AREA12') {
+    addSearchUrlFromTelegram_(
+      chatId,
+      'https://www.yad2.co.il/realestate/rent/center-and-sharon?area=12',
+      'אזור רחובות, מזכרת בתיה ונס ציונה (אזור 12)',
+      false
+    );
+    return;
+  }
   if (data === 'ADD_PRESET_AREA99') {
     addSearchUrlFromTelegram_(
       chatId,
@@ -2762,7 +2923,7 @@ function handlePriceCommandFromTelegram_(chatId, commandText) {
   sendPriceMenu_(chatId);
 }
 
-function addSearchUrlFromTelegram_(chatId, newUrl, customName, wasCleanedBBox) {
+function addSearchUrlFromTelegram_(chatId, newUrl, customName, wasCleanedBBox, wasConvertedFromForSale) {
   const ss = getSpreadsheet_();
   let sheet = ss.getSheetByName(CONFIG.SHEETS.SEARCHES);
   if (!sheet) {
@@ -2770,7 +2931,9 @@ function addSearchUrlFromTelegram_(chatId, newUrl, customName, wasCleanedBBox) {
     sheet = ss.getSheetByName(CONFIG.SHEETS.SEARCHES);
   }
 
-  const cleanUrl = newUrl.indexOf('bBox=') !== -1 ? sanitizeBBoxUrl_(newUrl) : newUrl;
+  const detectedForSale = Boolean(wasConvertedFromForSale || isForSaleYad2Url_(newUrl));
+  const rentNormalizedUrl = normalizeToRentUrl_(newUrl);
+  const cleanUrl = rentNormalizedUrl.indexOf('bBox=') !== -1 ? sanitizeBBoxUrl_(rentNormalizedUrl) : rentNormalizedUrl;
   const urlLimits = extractPriceLimitsFromYad2Url_(cleanUrl);
   const maxPriceColVal = urlLimits.maxPrice > 0 ? urlLimits.maxPrice : '';
 
@@ -2778,6 +2941,9 @@ function addSearchUrlFromTelegram_(chatId, newUrl, customName, wasCleanedBBox) {
   invalidateSearchesCache_();
 
   let notes = '';
+  if (detectedForSale) {
+    notes += '\n🔄 *התאמה אוטומטית:* הקישור זוהה כקישור למכירה (`forsale`) והומר אוטומטית לדירות להשכרה (`rent`)!';
+  }
   if (wasCleanedBBox || cleanUrl.indexOf('bBox=') !== -1) {
     notes += '\n🗺 *מצב bBox נקי:* הוסרו אוטומטית הגבלות עיר/אזור כדי לסרוק את כל המרחב הגיאוגרפי!';
   }
@@ -3045,6 +3211,7 @@ function buildSearchNameFromUrl_(url) {
   const areaMatch = url.match(/[?&]area=([^&]+)/);
 
   const areaNames = {
+    '12': 'אזור רחובות, מזכרת בתיה ונס ציונה (אזור 12)',
     '52': 'אזור גדרה - יבנה והסביבה',
     '99': 'אזור השפלה (קריית מלאכי, חצב והסביבה)',
     '21': 'אזור אשדוד - אשקלון והסביבה'
